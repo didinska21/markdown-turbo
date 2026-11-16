@@ -1211,6 +1211,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
     const chunk = [];
     chunk.push(sliceExpanded(lines[k], contentCol));
     const lazyMarks = new Set();
+    const setextLazy = new Set();
     const breakAfter = new Set();
     let hasContent = !isBlankLine(chunk[0]);
     let pendingBlanks = 0;
@@ -1331,6 +1332,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
       // line is marked so the item's paragraph lexer treats it as text
       if (pendingBlanks === 0 && isParaContinuation(l) && chunkEndsWithOpenParagraph(chunk, true)) {
         lazyMarks.add(chunk.length);
+        if (setextLevel(l) > 0) setextLazy.add(chunk.length);
         chunk.push(sliceExpanded(l, Math.floor(w.cols / 4) * 4));
         lastLine = j;
         j++;
@@ -1342,7 +1344,8 @@ function lexList(lines, i, end, ctx, firstMarker) {
     // lex the item chunk
     const childCtx = {
       defs: ctx.defs, eofNl: false, inList: true,
-      indentLazy: null, breakAfter: breakAfter.size ? breakAfter : null,
+      indentLazy: setextLazy.size ? setextLazy : null,
+      breakAfter: breakAfter.size ? breakAfter : null,
       forceContinue: lazyMarks.size ? lazyMarks : null,
       defSpans: [],
     };
