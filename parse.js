@@ -1341,6 +1341,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
       listDone = true;
     }
     if (blankBetween) loose = true;
+    const endBlanks = pendingBlanks;
     // lex the item chunk
     const childCtx = {
       defs: ctx.defs, eofNl: false, inList: true,
@@ -1375,7 +1376,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
         if (blocks[0].text === '') blocks.shift();
       }
     }
-    items.push({ blocks, task, checked });
+    items.push({ blocks, task, checked, endBlanks });
     if (k > lastLine) lastLine = k;
     if (listDone || !itemDone) {
       k = j;
@@ -1384,6 +1385,15 @@ function lexList(lines, i, end, ctx, firstMarker) {
     // start the next item at line j
     marker = listMarker(lines[j]);
     k = j;
+  }
+  // an HTML block that ends a non-final item keeps its trailing
+  // newline when a blank line followed it inside the item's span
+  for (let q = 0; q + 1 < items.length; q++) {
+    const bl = items[q].blocks;
+    if (bl.length > 0 && items[q].endBlanks > 0) {
+      const last = bl[bl.length - 1];
+      if (last.t === 'html' && !last.raw.endsWith('\n')) last.raw += '\n';
+    }
   }
   return {
     block: {
