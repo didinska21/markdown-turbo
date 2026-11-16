@@ -903,8 +903,12 @@ function lexBlocks(lines, start, end, ctx) {
           const l = lines[j];
           // a line of spaces plus exactly one tab is an (empty) row in
           // marked, not a blank line
-          if (isBlankLine(l) && !/^[ ]*\t$/.test(l)) break;
-          if (/^ {0,3}>/.test(l)) break;
+          if (/^[ ]*\t$/.test(l)) { rows.push(splitRowCells(l)); j++; continue; }
+          if (isBlankLine(l)) break;
+          // any other block start ends the table (heading, fence, hr,
+          // list, quote, HTML block, indented code)
+          if (!isParaContinuation(l)) break;
+          if (leadingWs(l).cols >= 4) break;
           rows.push(splitRowCells(l));
           j++;
         }
@@ -1044,6 +1048,18 @@ function tailOpenParagraph(blocks) {
     return tailOpenParagraph(last.items[last.items.length - 1].blocks);
   }
   return false;
+}
+
+// Like chunkEndsWithOpenParagraph, but only a paragraph at the chunk's
+// own top level counts (not one nested inside a sub-list or quote).
+function chunkEndsWithTopParagraph(chunkLines, inList) {
+  if (chunkLines.length === 0) return false;
+  const scratch = {
+    defs: new Map(), eofNl: false, inList: !!inList,
+    indentLazy: null, breakAfter: null, forceContinue: null,
+  };
+  const blocks = lexBlocks(chunkLines, 0, chunkLines.length, scratch);
+  return blocks.length > 0 && blocks[blocks.length - 1].t === 'paragraph';
 }
 
 // Speculatively lex a chunk of lines and report whether it ends with an
@@ -1212,9 +1228,20 @@ function lexList(lines, i, end, ctx, firstMarker) {
         break;
       }
       if (w.cols >= contentCol) {
+        const hadBlanks = pendingBlanks > 0;
         for (let b = 0; b < pendingBlanks; b++) chunk.push('');
         pendingBlanks = 0;
-        const frameLine = sliceExpanded(l, contentCol);
+        let frameLine = sliceExpanded(l, contentCol);
+        // a line absorbed into the item's open paragraph is stripped
+        // deeper in marked: the strip is the largest amount <= the
+        // line's indent that is congruent to contentCol mod 4
+        if (!hadBlanks && w.cols - contentCol >= 4 &&
+            isParaContinuation(frameLine) &&
+            chunkEndsWithTopParagraph(chunk, true)) {
+          const extra = Math.floor((w.cols - contentCol) / 4) * 4;
+          frameLine = sliceExpanded(l, contentCol + extra);
+          lazyMarks.add(chunk.length);
+        }
         chunk.push(frameLine);
         trackFence(frameLine);
         hasContent = true;
@@ -1222,12 +1249,12 @@ function lexList(lines, i, end, ctx, firstMarker) {
         j++;
         continue;
       }
-      // lazy continuation (never across a blank line); the line's leading
-      // whitespace is stripped up to the content column, and the line is
-      // marked so the item's paragraph lexer treats it as plain text
+      // lazy continuation (never across a blank line); marked strips
+      // only whole tab stops (4-column units) from such a line, and the
+      // line is marked so the item's paragraph lexer treats it as text
       if (pendingBlanks === 0 && isParaContinuation(l) && chunkEndsWithOpenParagraph(chunk, true)) {
         lazyMarks.add(chunk.length);
-        chunk.push(stripCols(l, contentCol));
+        chunk.push(sliceExpanded(l, Math.floor(w.cols / 4) * 4));
         lastLine = j;
         j++;
         continue;
@@ -1601,18 +1628,29 @@ function parseInline(text, defs) {
   // autolink while lexing the text of a link that actually forms).
   // Returns the source position just past the extended URL, or -1.
   function extendCappedAutolink(closeIdx) {
-    const nd = nodes[nodes.length - 1];
-    if (nd && nd.auto && nd.autoCapEnd === closeIdx) {
-      const url = scanAutolinkUrl(nd.autoStart, false);
-      if (url.length > nd.plain.length) {
-        const href = nd.autoKind === 'www' ? 'http://' + url : url;
-        nd.html = '<a href="' + escapeText(cleanUrl(href) ?? href) + '">' + escapeText(url) + '</a>';
-        nd.plain = url;
-        nd.autoCapEnd = -1;
-        return nd.autoStart + url.length;
-      }
+    // find the nearest capped autolink node, skipping over plain text
+    // nodes that the uncapped URL would have swallowed (e.g. a ')'
+    // that the capped scan trimmed)
+    let k = nodes.length - 1;
+    let span = 0;
+    while (k >= 0) {
+      const nd = nodes[k];
+      if (nd.auto && nd.autoCapEnd >= 0) break;
+      if (nd.k !== 'text') return -1;
+      span += nd.plain.length;
+      k--;
     }
-    return -1;
+    if (k < 0) return -1;
+    const nd = nodes[k];
+    if (nd.autoCapEnd + span !== closeIdx) return -1;
+    const url = scanAutolinkUrl(nd.autoStart, false);
+    if (url.length <= nd.plain.length) return -1;
+    const href = nd.autoKind === 'www' ? 'http://' + url : url;
+    nd.html = '<a href="' + escapeText(cleanUrl(href) ?? href) + '">' + escapeText(url) + '</a>';
+    nd.plain = url;
+    nd.autoCapEnd = -1;
+    nodes.length = k + 1;
+    return nd.autoStart + url.length;
   }
 
   function tryLink(closeIdx) {
@@ -1620,7 +1658,7 @@ function parseInline(text, defs) {
     const br = bracketStack[bracketStack.length - 1];
     if (!br.active) {
       bracketStack.pop();
-      return -1;
+      return extendCappedAutolink(closeIdx);
     }
     let dest = null;
     let title = null;
