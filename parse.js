@@ -1212,6 +1212,10 @@ function lexList(lines, i, end, ctx, firstMarker) {
     // body line at code depth (>= 4 after the frame strip) makes a
     // following unindented line end the fence and the item
     let fencePrevIndent = 0;
+    // whether the previous non-blank fence body line starts an HTML
+    // block (types 1-6): a following unindented line then also ends
+    // the fence and the item
+    let fencePrevHtml = false;
     const trackFence = (frameLine) => {
       if (openFence) {
         if (isFenceClose(frameLine, openFence.ch, openFence.len)) openFence = null;
@@ -1219,6 +1223,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
         openFence = fenceStart(frameLine);
         fenceStarted = false;
         fencePrevIndent = 0;
+        fencePrevHtml = false;
       }
     };
     while (j < end && !itemDone && !listDone) {
@@ -1226,7 +1231,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
       if (openFence) {
         const w0 = leadingWs(l);
         if (!isBlankLine(l) && w0.cols < contentCol &&
-            (!fenceStarted || fencePrevIndent >= 4)) {
+            (!fenceStarted || fencePrevIndent >= 4 || fencePrevHtml)) {
           listDone = true;
           break;
         }
@@ -1237,6 +1242,8 @@ function lexList(lines, i, end, ctx, firstMarker) {
         if (!isBlankLine(l)) {
           if (w0.cols >= contentCol) fenceStarted = true;
           fencePrevIndent = leadingWs(frameLine).cols;
+          const hb = htmlBlockStart(frameLine, true);
+          fencePrevHtml = hb !== null && hb.type <= 6;
           trackFence(frameLine);
         }
         hasContent = true;
