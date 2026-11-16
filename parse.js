@@ -604,6 +604,20 @@ function splitRowCells(line) {
   return cells.map((c) => c.trim());
 }
 
+// Fast shape test for a table delimiter row: only pipes, dashes,
+// colons and blanks, with at least one dash. Anything else cannot be
+// a delimiter row (each cell must reduce to :?-+:? once blanks are
+// removed), so callers can skip the full cell split.
+function isDelimiterShaped(line) {
+  let dash = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '-') dash = true;
+    else if (c !== '|' && c !== ':' && c !== ' ' && c !== '\t') return false;
+  }
+  return dash;
+}
+
 // Check whether line j is a delimiter row for a table whose header is
 // lines[j-1] with headerCells cells. Returns aligns array or null.
 function tableDelimiter(line, headerLine, headerCells) {
@@ -795,9 +809,13 @@ function lexBlocks(lines, start, end, ctx) {
   while (i < end) {
     const line = lines[i];
     if (isBlankLine(line)) { i++; continue; }
+    // a line whose first non-blank character cannot start any block
+    // construct can only be a table header or a paragraph start; the
+    // checks below are skipped for it (the table check still runs)
+    const plain = firstBlockChar(line) !== null;
 
     // fenced code
-    const fs = fenceStart(line);
+    const fs = plain ? null : fenceStart(line);
     if (fs) {
       const content = [];
       let j = i + 1;
@@ -826,7 +844,7 @@ function lexBlocks(lines, start, end, ctx) {
     }
 
     // ATX heading
-    const atx = atxHeading(line);
+    const atx = plain ? null : atxHeading(line);
     if (atx) {
       blocks.push({ t: 'heading', level: atx.level, text: atx.text, span: [i, i] });
       i++;
@@ -834,14 +852,14 @@ function lexBlocks(lines, start, end, ctx) {
     }
 
     // thematic break
-    if (isHrLine(line)) {
+    if (!plain && isHrLine(line)) {
       blocks.push({ t: 'hr', span: [i, i] });
       i++;
       continue;
     }
 
     // blockquote
-    if (/^ {0,3}>/.test(line)) {
+    if (!plain && /^ {0,3}>/.test(line)) {
       const r = lexBlockquote(lines, i, end, ctx);
       r.block.span = [i, r.next - 1];
       blocks.push(r.block);
@@ -850,7 +868,7 @@ function lexBlocks(lines, start, end, ctx) {
     }
 
     // list
-    const lm = listMarker(line);
+    const lm = plain ? null : listMarker(line);
     if (lm) {
       const r = lexList(lines, i, end, ctx, lm);
       r.block.span = [i, r.lastLine];
@@ -860,7 +878,7 @@ function lexBlocks(lines, start, end, ctx) {
     }
 
     // HTML block
-    const hb = htmlBlockStart(line, true);
+    const hb = plain ? null : htmlBlockStart(line, true);
     if (hb) {
       const r = lexHtmlBlock(lines, i, end, ctx, hb);
       r.block.span = [i, r.next - 1];
@@ -870,7 +888,7 @@ function lexBlocks(lines, start, end, ctx) {
     }
 
     // indented code block
-    if (leadingWs(line).cols >= 4) {
+    if (!plain && leadingWs(line).cols >= 4) {
       const content = [];
       let j = i;
       let lastContent = -1;
@@ -902,7 +920,7 @@ function lexBlocks(lines, start, end, ctx) {
     }
 
     // link reference definition
-    const def = tryParseDef(lines, i, end);
+    const def = plain ? null : tryParseDef(lines, i, end);
     if (def) {
       if (!ctx.defs.has(def.label)) {
         ctx.defs.set(def.label, { dest: def.dest, title: def.title });
@@ -913,7 +931,7 @@ function lexBlocks(lines, start, end, ctx) {
     }
 
     // table (header line + delimiter line)
-    if (i + 1 < end) {
+    if (i + 1 < end && isDelimiterShaped(lines[i + 1])) {
       const headerCells = splitRowCells(line);
       const aligns = tableDelimiter(lines[i + 1], line, headerCells);
       if (aligns) {
@@ -981,10 +999,26 @@ function lexParagraph(lines, i, end, ctx, hasNl) {
       j++;
       continue;
     }
+    // fast path: a line whose first non-blank character (at indent
+    // <= 3) cannot start any block construct is plain paragraph text;
+    // only the table check (which depends on the NEXT line) still runs
+    const fc = firstBlockChar(l);
+    if (fc !== null) {
+      if (j + 1 < end && isDelimiterShaped(lines[j + 1])) {
+        const aligns = tableDelimiter(lines[j + 1], l, splitRowCells(l));
+        if (aligns) break;
+      }
+      textLines.push(l);
+      textIdx.push(j);
+      j++;
+      continue;
+    }
     const sx = setextLevel(l);
     if (sx) { heading = sx; j++; break; }
-    // table starts here?
-    if (j + 1 < end) {
+    // table starts here? (fast pre-check: the next line must be
+    // delimiter-shaped — only pipes, dashes, colons and blanks —
+    // before doing the full cell split)
+    if (j + 1 < end && isDelimiterShaped(lines[j + 1])) {
       const aligns = tableDelimiter(lines[j + 1], l, splitRowCells(l));
       if (aligns) break;
     }
@@ -1074,45 +1108,128 @@ function tailOpenParagraph(blocks) {
   return false;
 }
 
-// Like chunkEndsWithOpenParagraph, but only a paragraph at the chunk's
-// own top level counts (not one nested inside a sub-list or quote).
-function chunkEndsWithTopParagraph(chunkLines, inList) {
-  if (chunkLines.length === 0) return false;
-  const scratch = {
-    defs: new Map(), eofNl: false, inList: !!inList,
-    indentLazy: null, breakAfter: null, forceContinue: null,
-  };
-  const blocks = lexBlocks(chunkLines, 0, chunkLines.length, scratch);
-  return blocks.length > 0 && blocks[blocks.length - 1].t === 'paragraph';
-}
+// Speculatively lex a chunk of lines (a list item's or blockquote's
+// collected lines, which only ever grow by appending) and report facts
+// about its trailing blocks, for laziness / continuation checks:
+//   topPara:     the last top-level block is a paragraph
+//   openPara:    the chunk ends with an open paragraph (deepest tail)
+//   followsList: the trailing top-level paragraph follows a list block
+// Results are memoized per chunk array; when the chunk has grown since
+// the last query, only the tail is re-lexed, starting from the last
+// block's first line (earlier blocks cannot change when lines are
+// appended — a block's extent is fixed once the lexer moves past it,
+// and the last block is recomputed in full). The memo lives and dies
+// with the chunk array itself (a per-parse data structure).
+const chunkTailCache = new WeakMap();
 
-// Whether the chunk's trailing top-level block is a paragraph that
-// follows a nested list block (the extra indent strip for paragraph
-// continuation lines does not apply to such paragraphs).
-function chunkParaFollowsList(chunkLines, inList) {
-  if (chunkLines.length === 0) return false;
-  const scratch = {
-    defs: new Map(), eofNl: false, inList: !!inList,
-    indentLazy: null, breakAfter: null, forceContinue: null,
-  };
-  const blocks = lexBlocks(chunkLines, 0, chunkLines.length, scratch);
-  if (blocks.length === 0 || blocks[blocks.length - 1].t !== 'paragraph') return false;
-  for (let b = 0; b + 1 < blocks.length; b++) {
-    if (blocks[b].t === 'list') return true;
+// In speculative (tailOnly) passes, the same container chunk is lexed
+// over and over (once per tail query on an ancestor chunk). Its block
+// structure depends only on its lines, the inList flag and the lazy
+// mark sets, so memoize it per parse() call. Only used in tailOnly
+// mode, where the resulting blocks are inspected read-only (never
+// rendered or mutated).
+function marksSig(set) {
+  if (!set || set.size === 0) return '';
+  return [...set].sort((a, b) => a - b).join(',');
+}
+function lexChunkMemo(chunkLines, childCtx) {
+  const memo = childCtx.tailMemo;
+  if (!memo || chunkLines.length > 32) {
+    return lexBlocks(chunkLines, 0, chunkLines.length, childCtx);
   }
-  return false;
+  let key = (childCtx.inList ? '1' : '0') + '\n' + chunkLines.join('\n');
+  if (childCtx.indentLazy || childCtx.breakAfter || childCtx.forceContinue) {
+    key += '\n' + marksSig(childCtx.indentLazy) + ';' + marksSig(childCtx.breakAfter) +
+      ';' + marksSig(childCtx.forceContinue);
+  }
+  let blocks = memo.get(key);
+  if (!blocks) {
+    blocks = lexBlocks(chunkLines, 0, chunkLines.length, childCtx);
+    memo.set(key, blocks);
+  }
+  return blocks;
 }
 
-// Speculatively lex a chunk of lines and report whether it ends with an
-// open paragraph (for laziness checks). Uses a throwaway defs map.
-function chunkEndsWithOpenParagraph(chunkLines, inList) {
-  if (chunkLines.length === 0) return false;
-  const scratch = {
-    defs: new Map(), eofNl: false, inList: !!inList,
-    indentLazy: null, breakAfter: null, forceContinue: null,
-  };
-  const blocks = lexBlocks(chunkLines, 0, chunkLines.length, scratch);
-  return tailOpenParagraph(blocks);
+function chunkTailInfo(chunkLines, inList, cache, memo) {
+  const empty = { topPara: false, openPara: false, followsList: false };
+  if (chunkLines.length === 0) return empty;
+  let ent = chunkTailCache.get(chunkLines);
+  if (!ent || ent.inList !== !!inList || ent.len > chunkLines.length) {
+    ent = { len: 0, blocks: [], inList: !!inList };
+    chunkTailCache.set(chunkLines, ent);
+  }
+  if (ent.len < chunkLines.length) {
+    // identical chunk contents recur constantly across speculative
+    // passes (the same item chunk re-collected into a fresh array);
+    // the per-parse content memo short-circuits those re-lexes. Only
+    // small chunks are keyed (the join costs more than the lex for
+    // large ones, which are reached via the array path anyway).
+    let key = null;
+    if (cache && ent.len === 0 && chunkLines.length <= 32) {
+      key = (inList ? '1' : '0') + '\n' + chunkLines.join('\n');
+      const hit = cache.get(key);
+      if (hit) {
+        ent.blocks = hit;
+        ent.len = chunkLines.length;
+      }
+    }
+    if (ent.len < chunkLines.length) {
+      const scratch = {
+        defs: new Map(), eofNl: false, inList: !!inList,
+        indentLazy: null, breakAfter: null, forceContinue: null,
+        tailCache: cache,
+        tailMemo: memo,
+      };
+      let restart = ent.len;
+      let keep = ent.blocks.length;
+      if (keep > 0) {
+        const lastB = ent.blocks[keep - 1];
+        restart = lastB.span[0];
+        // for a list, only its last item can change when lines are
+        // appended, so restart at that item's marker line instead of
+        // re-lexing the whole list
+        if (lastB.t === 'list' && lastB.lastItemStart > restart) {
+          restart = lastB.lastItemStart;
+        }
+        keep--;
+      }
+      scratch.tailOnly = true;
+      const tail = lexBlocks(chunkLines, restart, chunkLines.length, scratch);
+      ent.blocks = ent.blocks.slice(0, keep).concat(tail);
+      ent.len = chunkLines.length;
+      if (cache && chunkLines.length <= 32) {
+        if (key === null) key = (inList ? '1' : '0') + '\n' + chunkLines.join('\n');
+        cache.set(key, ent.blocks);
+      }
+    }
+  }
+  const blocks = ent.blocks;
+  if (blocks.length === 0) return empty;
+  const last = blocks[blocks.length - 1];
+  const topPara = last.t === 'paragraph';
+  let followsList = false;
+  if (topPara) {
+    for (let b = 0; b + 1 < blocks.length; b++) {
+      if (blocks[b].t === 'list') { followsList = true; break; }
+    }
+  }
+  return { topPara, openPara: tailOpenParagraph(blocks), followsList };
+}
+
+// If the line's first non-blank character (at an indent of at most 3
+// spaces) cannot begin any block construct, return that character;
+// otherwise return null. Block starts require one of the starter
+// characters below (headings, breaks, fences, quotes, HTML, lists,
+// setext underlines, table headers with pipes, link definitions).
+const BLOCK_STARTERS = new Set(['#', '-', '*', '+', '>', '<', '`', '~', '=', '|', '[', '_',
+  '0', '1', '2', '3', '4', '5', '6', '7', '8', '9']);
+function firstBlockChar(line) {
+  let p = 0;
+  while (line[p] === ' ') p++;
+  if (p > 3) return null;
+  const c = line[p];
+  if (c === undefined || c === '\t') return null;
+  return BLOCK_STARTERS.has(c) ? null : c;
 }
 
 // Is this line paragraph-continuation text (for laziness / interruption)?
@@ -1166,7 +1283,7 @@ function lexBlockquote(lines, i, end, ctx) {
     if (inner.length === 0) break;
     if (isBlankLine(inner[inner.length - 1])) break;
     if (!isParaContinuation(line)) break;
-    if (!chunkEndsWithOpenParagraph(inner, false)) break;
+    if (!chunkTailInfo(inner, false, ctx.tailCache, ctx.tailMemo).openPara) break;
     // accept the lazy line
     const idx = inner.length;
     const w = leadingWs(line);
@@ -1186,8 +1303,13 @@ function lexBlockquote(lines, i, end, ctx) {
     defs: ctx.defs, eofNl: false, inList: false,
     indentLazy, breakAfter, forceContinue,
     defSpans: [],
+    tailOnly: ctx.tailOnly,
+    tailCache: ctx.tailCache,
+    tailMemo: ctx.tailMemo,
   };
-  const blocks = lexBlocks(inner, 0, inner.length, childCtx);
+  const blocks = ctx.tailOnly
+    ? lexChunkMemo(inner, childCtx)
+    : lexBlocks(inner, 0, inner.length, childCtx);
   return { block: { t: 'quote', blocks }, next: k };
 }
 
@@ -1201,12 +1323,15 @@ function sameFamily(a, b) {
 
 function lexList(lines, i, end, ctx, firstMarker) {
   const items = [];
+  let deferredItem = null; // tailOnly mode: previous item, not yet lexed
   let loose = false;
   let k = i;
   let marker = firstMarker;
   let lastLine = i; // last line actually consumed into an item chunk
+  let lastItemStart = i; // marker line of the most recent item
   for (;;) {
     // collect one item starting at line k (marker line)
+    lastItemStart = k;
     const contentCol = marker.contentCol;
     const chunk = [];
     chunk.push(sliceExpanded(lines[k], contentCol));
@@ -1318,8 +1443,8 @@ function lexList(lines, i, end, ctx, firstMarker) {
         // line's indent that is congruent to contentCol mod 4
         if (!hadBlanks && w.cols - contentCol >= 4 &&
             isParaContinuation(frameLine) &&
-            chunkEndsWithTopParagraph(chunk, true) &&
-            !chunkParaFollowsList(chunk, true)) {
+            chunkTailInfo(chunk, true, ctx.tailCache, ctx.tailMemo).topPara &&
+            !chunkTailInfo(chunk, true, ctx.tailCache, ctx.tailMemo).followsList) {
           const extra = Math.floor((w.cols - contentCol) / 4) * 4;
           frameLine = sliceExpanded(l, contentCol + extra);
           lazyMarks.add(chunk.length);
@@ -1337,7 +1462,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
       // line is marked so the item's paragraph lexer treats it as text.
       // A line starting with a backtick run is never lazy, even when
       // the run is not a valid fence (backticks in the info string).
-      if (pendingBlanks === 0 && isParaContinuation(l) && chunkEndsWithOpenParagraph(chunk, true) &&
+      if (pendingBlanks === 0 && isParaContinuation(l) && chunkTailInfo(chunk, true, ctx.tailCache, ctx.tailMemo).openPara &&
           !(w.cols <= 3 && l.startsWith('```', w.end))) {
         lazyMarks.add(chunk.length);
         if (setextLevel(l) > 0) setextLazy.add(chunk.length);
@@ -1357,7 +1482,28 @@ function lexList(lines, i, end, ctx, firstMarker) {
       breakAfter: breakAfter.size ? breakAfter : null,
       forceContinue: lazyMarks.size ? lazyMarks : null,
       defSpans: [],
+      tailOnly: ctx.tailOnly,
+      tailCache: ctx.tailCache,
+      tailMemo: ctx.tailMemo,
     };
+    if (ctx.tailOnly) {
+      // speculative pass: only the list's LAST item's blocks are ever
+      // inspected (for the chunk's tail facts), so defer lexing each
+      // item's chunk; once the next item starts, the previous item is
+      // known not to be last and its chunk is dropped unlexed
+      if (deferredItem) {
+        items.push({ blocks: [], task: false, checked: false, endBlanks: deferredItem.endBlanks });
+      }
+      deferredItem = { chunk, childCtx, endBlanks };
+      if (k > lastLine) lastLine = k;
+      if (listDone || !itemDone) {
+        k = j;
+        break;
+      }
+      marker = listMarker(lines[j]);
+      k = j;
+      continue;
+    }
     const blocks = lexBlocks(chunk, 0, chunk.length, childCtx);
     // blank line between two consumed segments (blocks or link reference
     // definitions) inside the item => loose
@@ -1394,6 +1540,13 @@ function lexList(lines, i, end, ctx, firstMarker) {
     marker = listMarker(lines[j]);
     k = j;
   }
+  if (deferredItem) {
+    // tailOnly mode: lex only the final item's chunk (its tail is the
+    // list's tail); earlier items were pushed with empty blocks
+    const blocks = lexChunkMemo(deferredItem.chunk, deferredItem.childCtx);
+    items.push({ blocks, task: false, checked: false, endBlanks: deferredItem.endBlanks });
+    deferredItem = null;
+  }
   // an HTML block that ends a non-final item keeps its trailing
   // newline when a blank line followed it inside the item's span
   for (let q = 0; q + 1 < items.length; q++) {
@@ -1410,6 +1563,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
       start: firstMarker.start,
       loose,
       items,
+      lastItemStart,
     },
     next: k,
     lastLine,
@@ -2728,6 +2882,8 @@ export function parse(markdown) {
     defs: new Map(), eofNl, inList: false,
     indentLazy: null, breakAfter: null, forceContinue: null,
     defSpans: [],
+    tailCache: new Map(),
+    tailMemo: new Map(),
   };
   const blocks = lexBlocks(lines, 0, lines.length, ctx);
   return renderBlocks(blocks, ctx.defs);
