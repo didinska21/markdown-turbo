@@ -1536,7 +1536,8 @@ function parseInline(text, defs) {
       while (oi >= 0 && delimStack[oi].node.seq > floorSeq) {
         const opener = delimStack[oi];
         if (opener.ch === closer.ch && opener.canOpen && opener.node.len > 0) {
-          if (poison && closer.ch === poison.ch && poison.guarded.has(opener)) {
+          if (poison && closer.ch === poison.ch && poison.guarded.has(opener) &&
+              closer.node !== poison.fromNode) {
             if (poison.caseB) {
               // case B: the guarded opener is skipped for this closer
               // while budget lasts and the lengths sum to at most 3
@@ -1574,6 +1575,7 @@ function parseInline(text, defs) {
               guarded: new Set(delimStack.slice(0, oi)),
               budget: use === 2 ? 2 : (opener.canClose ? 1 : 2),
               caseB: use === 2,
+              fromNode: closer.node,
             };
           }
           if (use === 2 && poison && poison.ch === closer.ch && poison.guarded.has(opener)) {
@@ -1710,16 +1712,16 @@ function parseInline(text, defs) {
       p += m;
       lastEnd = p;
     }
-    if (lastEnd < 0) return 0;
+    if (lastEnd < 0) return { v: 0, tailInner: 0 };
     const trailing = to > lastEnd;
-    if (pending === 1) return fragile % 2 === 1 ? 1 : -1;
+    if (pending === 1) return { v: fragile % 2 === 1 ? 1 : -1, tailInner: inner };
     if (pending > 0) {
-      if (inner > 0 && inner % 2 === 0) return -1;
-      if (inner === 0 && trailing && fragile % 2 === 0) return -1;
-      return pending;
+      if (inner > 0 && inner % 2 === 0) return { v: -1, tailInner: inner };
+      if (inner === 0 && trailing && fragile % 2 === 0) return { v: -1, tailInner: inner };
+      return { v: pending, tailInner: inner };
     }
-    if (trailing && fragile % 2 === 1) return -1;
-    return 0;
+    if (trailing && fragile % 2 === 1) return { v: -1, tailInner: 0 };
+    return { v: 0, tailInner: 0 };
   }
 
   // Find the ']' that closes the bracket whose text starts at `from`,
@@ -1797,8 +1799,10 @@ function parseInline(text, defs) {
     // the ']' is then literal text, not a link close. The failure only
     // applies to inline links and full references; collapsed and
     // shortcut references still form.
-    const btPending = linkTextBackticks(br.srcIdx + (br.isImage ? 2 : 1), closeIdx);
+    const btRes = linkTextBackticks(br.srcIdx + (br.isImage ? 2 : 1), closeIdx);
+    const btPending = btRes.v;
     br.btPending = btPending;
+    br.btTailInner = btRes.tailInner;
     let dest = null;
     let title = null;
     let endPos = -1;
@@ -1942,16 +1946,19 @@ function parseInline(text, defs) {
         // after the opener) — correct because ']' is the current position.
       }
     }
-    if (br.btPending > 0) {
-      // the dead region exists only when a run of the pending length
-      // actually follows in this paragraph (it bounds the region)
+    if (br.btPending > 0 && br.btTailInner % 2 === 1) {
+      // a link whose text ends in an unterminated code span (with an
+      // odd number of runs inside that span) leaves a region where
+      // delimiter runs are inert; it lasts until the next backtick
+      // run of length 1 or the pending length, and exists only when
+      // such a run actually follows in this paragraph
       let p = endPos;
       while (p < n) {
         if (s[p] === '\\') { p += 2; continue; }
         if (s[p] === '`') {
           let m = 0;
           while (s[p + m] === '`') m++;
-          if (m === br.btPending) { deadDelim = br.btPending; break; }
+          if (m === 1 || m === br.btPending) { deadDelim = br.btPending; break; }
           p += m;
         } else p++;
       }
@@ -2011,7 +2018,7 @@ function parseInline(text, defs) {
       case '`': {
         let run = 0;
         while (s[i + run] === '`') run++;
-        if (deadDelim > 0 && run === deadDelim) {
+        if (deadDelim > 0 && (run === 1 || run === deadDelim)) {
           // this run ends the dead region and is lexed normally
           deadDelim = 0;
         }
@@ -2033,7 +2040,7 @@ function parseInline(text, defs) {
           const top = bracketStack[bracketStack.length - 1];
           const textStart = top.srcIdx + (top.isImage ? 2 : 1);
           const cand = bracketCloseCandidate(textStart);
-          if (cand >= 0 && found >= cand && linkTextBackticks(textStart, cand) >= 0) {
+          if (cand >= 0 && found >= cand && linkTextBackticks(textStart, cand).v >= 0) {
             found = -1;
           }
         }
