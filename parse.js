@@ -1452,6 +1452,10 @@ function parseInline(text, defs) {
   // -- emphasis processing over the delimiter stack, for entries whose node
   // seq is greater than floorSeq.
   function processEmphasis(floorSeq) {
+    // the poison state is local to one emphasis pass: a match made
+    // while resolving a link's text must not affect the enclosing text
+    const savedPoison = poison;
+    poison = null;
     // find first closer above the floor
     let ci = 0;
     while (ci < delimStack.length) {
@@ -1468,7 +1472,10 @@ function parseInline(text, defs) {
         const opener = delimStack[oi];
         if (opener.ch === closer.ch && opener.canOpen && opener.node.len > 0) {
           if (poison && closer.ch === poison.ch && poison.guarded.has(opener) &&
-              opener.node.len === 2 && closer.node.len <= poison.budget) {
+              closer.node.len <= poison.budget &&
+              (poison.caseB
+                ? closer.node.len + opener.node.len <= 3
+                : opener.node.len === 2)) {
             poisonBlocked = true;
             break;
           }
@@ -1489,11 +1496,13 @@ function parseInline(text, defs) {
           const tag = closer.ch === '~' ? 'del' : use === 2 ? 'strong' : 'em';
           opener.node.len -= use;
           closer.node.len -= use;
-          if (closer.canOpen && use === 1 && opener.node.len === 0) {
+          if (closer.canOpen && opener.node.len === 0 &&
+              (use === 1 || (use === 2 && !opener.canClose))) {
             poison = {
               ch: closer.ch,
               guarded: new Set(delimStack.slice(0, oi)),
-              budget: opener.canClose ? 1 : 2,
+              budget: use === 2 ? 2 : (opener.canClose ? 1 : 2),
+              caseB: use === 2,
             };
           }
           opener.node.open = '<' + tag + '>' + (opener.node.open || '');
@@ -1529,6 +1538,7 @@ function parseInline(text, defs) {
     for (let k = delimStack.length - 1; k >= 0; k--) {
       if (delimStack[k].node.seq > floorSeq) delimStack.splice(k, 1);
     }
+    poison = savedPoison;
   }
 
   function flanking(pos, runLen) {
@@ -2125,12 +2135,31 @@ function parseInline(text, defs) {
   }
 
   // GFM extended autolinks starting at position i (c is s[i]).
+  // Boundary for a 'www.' autolink (scheme URLs need none): the
+  // candidate must start a token, or follow a text run whose last
+  // character is whitespace or one of * _ ~ (. Any non-text token
+  // (code span, link, image, break, tag) is a boundary by itself;
+  // entity references count as text.
+  function wwwBoundaryOk() {
+    if (buf.length > 0) {
+      const c = buf[buf.length - 1];
+      return isWs(c) || '*_~('.includes(c);
+    }
+    const nd = nodes[nodes.length - 1];
+    if (!nd) return true;
+    if (nd.k === 'delim') return true;
+    if (nd.k === 'open') return false;
+    if (nd.k === 'text' || (nd.k === 'raw' && nd.plain.startsWith('&'))) {
+      const p = nd.plain;
+      if (!p) return true;
+      const c = p[p.length - 1];
+      return isWs(c) || '*_~('.includes(c);
+    }
+    return true;
+  }
+
   function tryExtendedAutolink() {
     if (docState.inLinkTag) return false;
-    // boundary: previous emitted char must be start, whitespace or one of
-    // the delimiter characters * _ ~ ( [ { " ' <
-    const prev = buf.length > 0 ? buf[buf.length - 1] : (nodes.length > 0 ? lastPlainChar() : '');
-    if (!(prev === '' || isWs(prev) || '*_~([{"\'<'.includes(prev))) return false;
     const rest = s.slice(i);
     let kind = null;
     let prefixLen = 0;
@@ -2142,6 +2171,7 @@ function parseInline(text, defs) {
     else if (head.startsWith('https://')) { kind = 'url'; prefixLen = 8; }
     else if (head.startsWith('ftp://')) { kind = 'url'; prefixLen = 6; }
     else return false;
+    if (kind === 'www' && !wwwBoundaryOk()) return false;
     // consume the URL (balanced-paren rules inside scanAutolinkUrl);
     // inside an open bracket the run stops before the closing ']' so
     // the bracket can close — if the link then fails, the node is
