@@ -1720,6 +1720,46 @@ function parseInline(text, defs) {
   // run's own position when it is not inside a span
   let deadZone = 0;
   let deadFrom = 0;
+  const liveOpeners = new Set(); // source positions of tokenized '[' brackets
+  // compute the dead region left by a link (or phantom reference) whose
+  // text ends in an unterminated code span of length `pending`: the
+  // region runs from fromPos to the start of the code span containing
+  // the last later run of that length (or of length 1 when no run of
+  // that length exists); with neither, there is no region
+  function armDeadRegion(fromPos, pending) {
+    let p = fromPos;
+    let endLen = 0;
+    let endPosRun = -1;
+    const runs = [];
+    while (p < n) {
+      if (s[p] === '\\') { p += 2; continue; }
+      if (s[p] === '`') {
+        let m = 0;
+        while (s[p + m] === '`') m++;
+        runs.push([p, m]);
+        if (m === pending) { endLen = m; endPosRun = p; }
+        else if (m === 1 && endLen === 0) endPosRun = p;
+        p += m;
+      } else p++;
+    }
+    if (endPosRun >= 0 && endLen === 0) endLen = 1;
+    if (endLen > 0) {
+      let openStart = -1;
+      let openLen = 0;
+      let zone = endPosRun;
+      for (const [rp, rm] of runs) {
+        if (openStart < 0) {
+          if (rp === endPosRun) { zone = rp; break; }
+          openStart = rp; openLen = rm;
+        } else if (rm === openLen) {
+          if (rp === endPosRun) { zone = openStart; break; }
+          openStart = -1;
+        } else if (rp === endPosRun) { zone = openStart; break; }
+      }
+      deadZone = zone;
+      deadFrom = fromPos;
+    }
+  }
   // marked quirk: when a delimiter run that can both open and close forms
   // an em (use 1) pair that fully consumes a length-1 opener, the openers
   // below it become "guarded": a later closer of the same char cannot pair
@@ -2261,46 +2301,7 @@ function parseInline(text, defs) {
       }
     }
     if (armRegion && br.btPending > 0 && br.btTailInner % 2 === 1) {
-      // a link whose text ends in an unterminated code span (with an
-      // odd number of runs inside that span) leaves a region where
-      // delimiter runs are inert. The region runs until the LAST
-      // later backtick run of the pending length when one exists,
-      // else the last later run of length 1; with neither, there is
-      // no region at all.
-      let p = endPos;
-      let endLen = 0;
-      let endPosRun = -1;
-      const runs = [];
-      while (p < n) {
-        if (s[p] === '\\') { p += 2; continue; }
-        if (s[p] === '`') {
-          let m = 0;
-          while (s[p + m] === '`') m++;
-          runs.push([p, m]);
-          if (m === br.btPending) { endLen = m; endPosRun = p; }
-          else if (m === 1 && endLen === 0) endPosRun = p;
-          p += m;
-        } else p++;
-      }
-      if (endPosRun >= 0 && endLen === 0) endLen = 1;
-      if (endLen > 0) {
-        // find the boundary: the start of the span containing the
-        // last endLen run, or that run itself when it opens a span
-        let openStart = -1;
-        let openLen = 0;
-        let zone = endPosRun;
-        for (const [rp, rm] of runs) {
-          if (openStart < 0) {
-            if (rp === endPosRun) { zone = rp; break; }
-            openStart = rp; openLen = rm;
-          } else if (rm === openLen) {
-            if (rp === endPosRun) { zone = openStart; break; }
-            openStart = -1;
-          } else if (rp === endPosRun) { zone = openStart; break; }
-        }
-        deadZone = zone;
-        deadFrom = endPos;
-      }
+      armDeadRegion(endPos, br.btPending);
     }
     return endPos;
   }
@@ -2494,6 +2495,7 @@ function parseInline(text, defs) {
         const node = { k: 'open', image: false, html: '[', plain: '[', seq: NODE_SEQ++ };
         nodes.push(node);
         bracketStack.push({ node, isImage: false, active: true, srcIdx: i });
+        liveOpeners.add(i);
         i++;
         break;
       }
@@ -2640,6 +2642,42 @@ function parseInline(text, defs) {
     }
   }
   flushBuf();
+  // Phantom references: a [text][label] pattern in the source whose
+  // label is defined and whose text ends in an unterminated code span
+  // (odd number of inner runs), but whose opening bracket was never
+  // tokenized (a code span swallowed it), still leaves a dead region
+  // in marked. A pattern whose bracket WAS tokenized is a live
+  // reference and leaves none.
+  {
+    let p = 0;
+    while (p < n) {
+      if (s[p] === '\\') { p += 2; continue; }
+      if (s[p] !== '[' || s[p - 1] === '!' || liveOpeners.has(p)) { p++; continue; }
+      let depth = 0;
+      let close = -1;
+      for (let q = p; q < n; q++) {
+        if (s[q] === '\\') { q++; continue; }
+        if (s[q] === '[') depth++;
+        else if (s[q] === ']') { depth--; if (depth === 0) { close = q; break; } }
+      }
+      if (close < 0 || s[close + 1] !== '[') { p++; continue; }
+      let lclose = -1;
+      depth = 0;
+      for (let q = close + 1; q < n; q++) {
+        if (s[q] === '\\') { q++; continue; }
+        if (s[q] === '[') depth++;
+        else if (s[q] === ']') { depth--; if (depth === 0) { lclose = q; break; } }
+      }
+      if (lclose < 0) { p++; continue; }
+      const label = s.slice(close + 2, lclose);
+      if (!label.trim() || !defs.has(normalizeLabel(label))) { p++; continue; }
+      const bt = linkTextBackticks(p + 1, close);
+      if (bt.v >= 1 && bt.tailInner % 2 === 1 && lclose + 1 > deadFrom) {
+        armDeadRegion(lclose + 1, bt.v);
+      }
+      p++;
+    }
+  }
   processEmphasis(-1);
 
   let out = '';
