@@ -13,7 +13,7 @@
 // ---------------------------------------------------------------------------
 
 const ASCII_PUNCT = new Set('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~');
-const PUNCT_RE = /\p{P}/u;
+const PUNCT_RE = /[\p{P}\p{S}]/u;
 
 function isPunct(ch) {
   if (ch === undefined || ch === '') return false;
@@ -126,7 +126,9 @@ function cleanUrl(href) {
 
 /** The key a link label is stored and looked up under. */
 function normalizeLabel(label) {
-  return label.replace(/\s+/g, ' ').trim().toLowerCase();
+  // Unicode case folding, as far as marked applies it: lowercasing plus
+  // the sharp-s fold (ß and ẞ both fold to ss, matching SS).
+  return label.replace(/\s+/g, ' ').trim().toLowerCase().replace(/ß/g, 'ss');
 }
 
 // ---------------------------------------------------------------------------
@@ -361,22 +363,19 @@ function tryParseDef(lines, i, end) {
   while (p < s.length && cols < 3 && s[p] === ' ') { p++; cols++; }
   if (s[p] === '\t') p++;
   if (s[p] !== '[') return null;
-  // scan label with bracket depth
+  // scan the label: it ends at the first unescaped ']' and may not contain
+  // an unescaped '[' (marked's definition grammar is that strict)
   let j = p + 1;
-  let depth = 1;
   let label = '';
+  let closed = false;
   while (j < s.length) {
     const c = s[j];
     if (c === '\\' && j + 1 < s.length) { label += c + s[j + 1]; j += 2; continue; }
-    if (c === '[') { depth++; label += c; j++; continue; }
-    if (c === ']') {
-      depth--;
-      if (depth === 0) break;
-      label += c; j++; continue;
-    }
+    if (c === '[') return null;
+    if (c === ']') { closed = true; break; }
     label += c; j++;
   }
-  if (depth !== 0 || j >= s.length) return null;
+  if (!closed || j >= s.length) return null;
   if (label.trim() === '') return null;
   if (s[j + 1] !== ':') return null;
   // whitespace after colon: spaces/tabs and at most one newline
@@ -457,7 +456,7 @@ function tryParseDef(lines, i, end) {
   }
   const endLine = lineOf(Math.max(usedEndPos - 1, 0));
   return {
-    label: normalizeLabel(unescapeString(label)),
+    label: normalizeLabel(label),
     dest,
     title,
     linesUsed: endLine + 1,
@@ -522,6 +521,13 @@ function scanHtmlTag(s, p) {
   if (i >= s.length || !/[A-Za-z]/.test(s[i])) return null;
   let name = '';
   while (i < s.length && /[A-Za-z0-9-]/.test(s[i])) { name += s[i]; i++; }
+  if (closing) {
+    // a closing tag allows only whitespace before '>'
+    while (i < s.length && /[ \t\n]/.test(s[i])) i++;
+    if (s[i] === '>') return { end: i + 1, name, closing, selfClosing: false, complete: true };
+    if (i >= s.length) return { end: i, name, closing, selfClosing: false, complete: false };
+    return null;
+  }
   // attributes
   for (;;) {
     let ws = 0;
@@ -530,9 +536,10 @@ function scanHtmlTag(s, p) {
     if (s[i] === '>') return { end: i + 1, name, closing, selfClosing: false, complete: true };
     if (s[i] === '/' && s[i + 1] === '>') return { end: i + 2, name, closing, selfClosing: true, complete: true };
     if (ws === 0) return null; // attributes must be space-separated
-    // attribute name
-    if (!/[^\s"'<>\/=]/.test(s[i])) return null;
-    while (i < s.length && /[^\s"'<>\/=]/.test(s[i])) i++;
+    // attribute name: [A-Za-z_:][A-Za-z0-9_.:-]*
+    if (!/[A-Za-z_:]/.test(s[i])) return null;
+    i++;
+    while (i < s.length && /[A-Za-z0-9_.:-]/.test(s[i])) i++;
     // optional value
     let j = i;
     while (j < s.length && /[ \t\n]/.test(s[j])) j++;
@@ -1386,8 +1393,7 @@ function plainOfNodes(nodes) {
 }
 
 const INTERESTING = new Set(['\\', '`', '<', '!', '[', ']', '*', '_', '~', '&', '\n', '@', 'w', 'h', 'f', 'm', 'x']);
-const EMAIL_LOCAL_RE = /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+$/;
-const EMAIL_DOMAIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+/;
+const EMAIL_LOCAL_CHARS = new Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.!#$%&'*+/=?^_`{|}~-");
 
 function parseInline(text, defs) {
   const s = text;
@@ -1422,14 +1428,12 @@ function parseInline(text, defs) {
       while (oi >= 0 && delimStack[oi].node.seq > floorSeq) {
         const opener = delimStack[oi];
         if (opener.ch === closer.ch && opener.canOpen && opener.node.len > 0) {
-          // rule of 3 for * and _
-          if (closer.ch === '*' || closer.ch === '_') {
-            const ol = opener.node.len;
-            const cl = closer.node.len;
-            if ((ol + cl) % 3 === 0 && !(ol % 3 === 0 && cl % 3 === 0)) {
-              oi--;
-              continue;
-            }
+          // rule of 3: only when one of the runs can both open and close
+          if ((closer.canOpen || opener.canClose) &&
+              (opener.node.len + closer.node.len) % 3 === 0 &&
+              !(opener.node.len % 3 === 0 && closer.node.len % 3 === 0)) {
+            oi--;
+            continue;
           }
           // apply
           let use;
@@ -1494,6 +1498,7 @@ function parseInline(text, defs) {
     let endPos = -1;
     let labelText = null; // for ref lookups
     const after = closeIdx + 1;
+    let formed = false;
     if (s[after] === '(') {
       // inline link
       let p = after + 1;
@@ -1527,8 +1532,10 @@ function parseInline(text, defs) {
           }
         }
       }
-      if (endPos < 0) return -1;
-    } else if (s[after] === '[') {
+      if (endPos >= 0) formed = true;
+      // a failed inline parse falls through to the shortcut reference
+    }
+    if (!formed && s[after] === '[') {
       // full or collapsed reference
       let j = after + 1;
       let depth = 1;
@@ -1544,23 +1551,30 @@ function parseInline(text, defs) {
         }
         lab += c; j++;
       }
-      if (depth !== 0) return -1;
-      if (lab === '') {
-        // collapsed: label is the link text source
-        labelText = s.slice(br.srcIdx + (br.isImage ? 2 : 1), closeIdx);
-      } else {
-        labelText = lab;
+      if (depth === 0) {
+        if (lab === '') {
+          // collapsed: label is the link text source
+          labelText = s.slice(br.srcIdx + (br.isImage ? 2 : 1), closeIdx);
+        } else if (normalizeLabel(lab) !== '') {
+          labelText = lab;
+        }
+        if (labelText !== null) {
+          const def = defs.get(normalizeLabel(labelText));
+          if (!def) { bracketStack.pop(); return -1; }
+          dest = def.dest;
+          title = def.title;
+          endPos = j + 1;
+          formed = true;
+        }
+        // a whitespace-only label counts as no reference: fall through
       }
-      endPos = j + 1;
-      const def = defs.get(normalizeLabel(unescapeString(labelText)));
-      if (!def) return -1;
-      dest = def.dest;
-      title = def.title;
-    } else {
-      // shortcut reference
+      // an unclosed label falls through to the shortcut reference
+    }
+    if (!formed) {
+      // shortcut reference (labels match on their raw source text)
       labelText = s.slice(br.srcIdx + (br.isImage ? 2 : 1), closeIdx);
-      const def = defs.get(normalizeLabel(unescapeString(labelText)));
-      if (!def) return -1;
+      const def = defs.get(normalizeLabel(labelText));
+      if (!def) { bracketStack.pop(); return -1; }
       dest = def.dest;
       title = def.title;
       endPos = after;
@@ -1621,10 +1635,12 @@ function parseInline(text, defs) {
       case '\\': {
         const nx = s[i + 1];
         if (nx === '\n') {
-          // hard break (backslash at end of line)
+          // hard break (backslash at end of line); leading whitespace of
+          // the next line is stripped
           flushBuf();
           nodes.push(rawNode('<br>', ''));
           i += 2;
+          while (i < n && (s[i] === ' ' || s[i] === '\t')) i++;
         } else if (nx !== undefined && ASCII_PUNCT.has(nx)) {
           if (nx === '&') {
             flushBuf();
@@ -1640,15 +1656,18 @@ function parseInline(text, defs) {
         break;
       }
       case '\n': {
-        // hard break if buf ends with 2+ spaces
+        // hard break if buf ends with 2+ spaces; leading whitespace of
+        // the next line is stripped
         if (buf.endsWith('  ')) {
           buf = buf.replace(/ +$/, '');
           flushBuf();
           nodes.push(rawNode('<br>', ''));
+          i++;
+          while (i < n && (s[i] === ' ' || s[i] === '\t')) i++;
         } else {
           buf += '\n';
+          i++;
         }
-        i++;
         break;
       }
       case '`': {
@@ -1683,7 +1702,14 @@ function parseInline(text, defs) {
       case '<': {
         const rest = s.slice(i);
         let handled = false;
-        if (rest.startsWith('<!--')) {
+        if (rest.startsWith('<!-->') || rest.startsWith('<!--->')) {
+          // abruptly closed empty comments are complete comments in marked
+          const len = rest.startsWith('<!-->') ? 5 : 6;
+          flushBuf();
+          nodes.push(rawNode(s.slice(i, i + len), ''));
+          i += len;
+          handled = true;
+        } else if (rest.startsWith('<!--')) {
           const e = s.indexOf('-->', i + 4);
           if (e >= 0) {
             flushBuf();
@@ -1719,7 +1745,7 @@ function parseInline(text, defs) {
         if (!handled) {
           // autolink or tag
           const am = /^<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>/.exec(rest);
-          const em = /^<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+)>/.exec(rest);
+          const em = /^<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*)>/.exec(rest);
           if (am) {
             const url = am[1];
             const href = cleanUrl(url);
@@ -1752,7 +1778,7 @@ function parseInline(text, defs) {
       case '!': {
         if (s[i + 1] === '[') {
           flushBuf();
-          const node = { k: 'open', image: true, html: '![', plain: '', seq: NODE_SEQ++ };
+          const node = { k: 'open', image: true, html: '![', plain: '![', seq: NODE_SEQ++ };
           nodes.push(node);
           bracketStack.push({ node, isImage: true, active: true, srcIdx: i });
           i += 2;
@@ -1764,7 +1790,7 @@ function parseInline(text, defs) {
       }
       case '[': {
         flushBuf();
-        const node = { k: 'open', image: false, html: '[', plain: '', seq: NODE_SEQ++ };
+        const node = { k: 'open', image: false, html: '[', plain: '[', seq: NODE_SEQ++ };
         nodes.push(node);
         bracketStack.push({ node, isImage: false, active: true, srcIdx: i });
         i++;
@@ -1840,26 +1866,7 @@ function parseInline(text, defs) {
         break;
       }
       case '@': {
-        // GFM email autolink: local part is the suffix of buf
-        const lm = EMAIL_LOCAL_RE.exec(buf);
-        let done = false;
-        if (lm && lm[0].length > 0) {
-          const dm = EMAIL_DOMAIN_RE.exec(s.slice(i + 1));
-          if (dm) {
-            const afterDomain = s[i + 1 + dm[0].length];
-            if (!(afterDomain !== undefined && /[A-Za-z0-9_]/.test(afterDomain))) {
-              const email = lm[0] + '@' + dm[0];
-              buf = buf.slice(0, buf.length - lm[0].length);
-              flushBuf();
-              nodes.push(rawNode(
-                '<a href="mailto:' + escapeText(email) + '">' + escapeText(email) + '</a>',
-                email));
-              i = i + 1 + dm[0].length;
-              done = true;
-            }
-          }
-        }
-        if (!done) {
+        if (!tryEmailAutolink()) {
           buf += '@';
           i++;
         }
@@ -1889,12 +1896,131 @@ function parseInline(text, defs) {
   }
   return out;
 
+  // GFM email autolink at the '@' at position i. The local part is read
+  // from the source (an escaped character inside it poisons the match),
+  // an optional mailto:/xmpp: scheme directly before it is included, and
+  // the domain must validate as a whole: one trailing '.' may be dropped,
+  // but a domain ending in '-' or '_' (or with a bad label) kills it.
+  // The local part may span inert delimiter nodes (a literal '_' or '~'
+  // run) and the tail of the current text buffer.
+  function tryEmailAutolink() {
+    let ls = i;
+    while (ls > 0 && EMAIL_LOCAL_CHARS.has(s[ls - 1])) ls--;
+    if (ls === i) return false;
+    const local = s.slice(ls, i);
+    if (ls >= 2 && s[ls - 1] === '\\' && EMAIL_LOCAL_CHARS.has(s[ls - 2])) return false;
+    // Plan how to absorb a target string (scheme + local, or just local)
+    // from the tail of the output stream. Returns null when the target is
+    // not sitting verbatim at the tail.
+    function planTail(target) {
+      let need = target.length - buf.length;
+      if (need <= 0) {
+        return buf.endsWith(target)
+          ? { bufKeep: buf.length - target.length, dropFrom: nodes.length, split: null, prev: null }
+          : null;
+      }
+      let k = nodes.length;
+      let acc = '';
+      let split = null;
+      while (need > 0 && k > 0) {
+        const nd = nodes[k - 1];
+        let p = null;
+        if (nd.k === 'text') p = nd.plain;
+        else if (nd.k === 'delim' && (nd.ch === '_' || nd.ch === '~')) p = nd.ch.repeat(nd.len);
+        else return null; // any other node is a barrier
+        if (p.length <= need) {
+          acc = p + acc;
+          need -= p.length;
+          k--;
+        } else {
+          if (nd.k !== 'text') return null;
+          const head = p.slice(0, p.length - need);
+          acc = p.slice(p.length - need) + acc;
+          split = { idx: k - 1, head };
+          need = 0;
+          k--;
+          break;
+        }
+      }
+      if (need > 0 || acc + buf !== target) return null;
+      return { bufKeep: 0, dropFrom: k, split, prev: null };
+    }
+    let scheme = '';
+    let plan = planTail('mailto:' + local);
+    if (plan) scheme = 'mailto:';
+    else {
+      plan = planTail('xmpp:' + local);
+      if (plan) scheme = 'xmpp:';
+      else plan = planTail(local);
+    }
+    if (!plan) return false;
+    // boundary: the character just before the absorbed candidate
+    let prev;
+    if (plan.bufKeep > 0) prev = buf[plan.bufKeep - 1];
+    else if (plan.split && plan.split.head) prev = plan.split.head[plan.split.head.length - 1];
+    else if (plan.dropFrom > 0) {
+      const nd = nodes[plan.dropFrom - 1];
+      const p = nd.k === 'delim' ? nd.ch : (nd.plain || '');
+      prev = p ? p[p.length - 1] : '';
+    } else prev = lastPlainChar();
+    if (!(prev === '' || isWs(prev) || '*_~([{"\'<'.includes(prev))) return false;
+    // domain: maximal run of [A-Za-z0-9._-]
+    let de = i + 1;
+    while (de < n && /[A-Za-z0-9._-]/.test(s[de])) de++;
+    let dom = s.slice(i + 1, de);
+    let used = dom.length;
+    if (dom.endsWith('.')) { dom = dom.slice(0, -1); used--; }
+    if (dom === '') return false;
+    const labels = dom.split('.');
+    if (labels.length < 2) return false;
+    for (const lab of labels) {
+      if (!/^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/.test(lab)) return false;
+    }
+    let endPos = i + 1 + used;
+    let resource = '';
+    if (scheme === 'xmpp:' && s[endPos] === '/') {
+      let re = endPos + 1;
+      while (re < n && /[A-Za-z0-9._~@-]/.test(s[re])) re++;
+      if (re > endPos + 1) {
+        resource = s.slice(endPos, re);
+        endPos = re;
+      }
+    }
+    const text = scheme + local + '@' + dom + resource;
+    const href = scheme ? text : 'mailto:' + text;
+    // absorb the candidate: drop fully covered nodes (and any delimiter
+    // stack entries pointing at them), split a partially covered text
+    // node, and trim the buffer
+    for (let k = plan.dropFrom; k < nodes.length; k++) {
+      const nd = nodes[k];
+      if (nd.k === 'delim') {
+        const di = delimStack.findIndex(d => d.node === nd);
+        if (di >= 0) delimStack.splice(di, 1);
+      }
+    }
+    nodes.length = plan.dropFrom;
+    if (plan.split) {
+      const old = nodes[plan.split.idx];
+      nodes.push({
+        k: 'text',
+        html: escapeText(plan.split.head),
+        plain: plan.split.head,
+        seq: old.seq,
+      });
+    }
+    buf = buf.slice(0, plan.bufKeep);
+    flushBuf();
+    nodes.push(rawNode('<a href="' + escapeText(href) + '">' + escapeText(text) + '</a>', text));
+    i = endPos;
+    return true;
+  }
+
   // GFM extended autolinks starting at position i (c is s[i]).
   function tryExtendedAutolink() {
     // boundary: previous emitted char must be start, whitespace or one of
-    // the delimiter characters * _ ~ ( [ { " '
+    // the delimiter characters * _ ~ ( [ { " ' <
     const prev = buf.length > 0 ? buf[buf.length - 1] : (nodes.length > 0 ? lastPlainChar() : '');
-    if (!(prev === '' || isWs(prev) || '*_~([{"\''.includes(prev))) return false;
+    if (!(prev === '' || isWs(prev) || '*_~([{"\'<'.includes(prev))) return false;
     const rest = s.slice(i);
     let kind = null;
     let prefixLen = 0;
@@ -1902,31 +2028,11 @@ function parseInline(text, defs) {
     else if (rest.startsWith('http://')) { kind = 'url'; prefixLen = 7; }
     else if (rest.startsWith('https://')) { kind = 'url'; prefixLen = 8; }
     else if (rest.startsWith('ftp://')) { kind = 'url'; prefixLen = 6; }
-    else if (rest.startsWith('mailto:')) { kind = 'mailto'; prefixLen = 7; }
-    else if (rest.startsWith('xmpp:')) { kind = 'xmpp'; prefixLen = 5; }
     else return false;
     // consume until whitespace or '<'
     let j = i;
     while (j < n && !isWs(s[j]) && s[j] !== '<') j++;
     let url = s.slice(i, j);
-    if (kind === 'mailto' || kind === 'xmpp') {
-      // address part must look like an email (xmpp may add /resource)
-      const addr = url.slice(prefixLen);
-      const em = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+/.exec(addr);
-      if (!em) return false;
-      const rest = addr.slice(em[0].length);
-      if (kind === 'mailto' && rest !== '') return false;
-      if (kind === 'xmpp' && rest !== '') {
-        if (rest[0] !== '/') return false;
-        // resource runs until the next '@' or '/'
-        const res = /^[^@\/]*/.exec(rest.slice(1))[0];
-        url = url.slice(0, prefixLen + em[0].length + 1 + res.length);
-      }
-      flushBuf();
-      nodes.push(rawNode('<a href="' + escapeText(url) + '">' + escapeText(url) + '</a>', url));
-      i = i + url.length;
-      return true;
-    }
     // www / url: trim trailing punctuation
     url = trimAutolinkUrl(url);
     if (url.length <= prefixLen) return false;
