@@ -1495,6 +1495,7 @@ function parseInline(text, defs) {
   // length L, marked leaves every delimiter run inert until the next
   // run of L backticks (which is itself literal): deadDelim tracks L
   let deadDelim = 0;
+  let deadEnd = 0;
   // marked quirk: when a delimiter run that can both open and close forms
   // an em (use 1) pair that fully consumes a length-1 opener, the openers
   // below it become "guarded": a later closer of the same char cannot pair
@@ -1949,19 +1950,23 @@ function parseInline(text, defs) {
     if (br.btPending > 0 && br.btTailInner % 2 === 1) {
       // a link whose text ends in an unterminated code span (with an
       // odd number of runs inside that span) leaves a region where
-      // delimiter runs are inert; it lasts until the next backtick
-      // run of length 1 or the pending length, and exists only when
-      // such a run actually follows in this paragraph
+      // delimiter runs are inert. The region ends at the first later
+      // backtick run of the pending length when one exists, else at
+      // the first later run of length 1; with neither, there is no
+      // region at all.
       let p = endPos;
+      let endLen = 0;
       while (p < n) {
         if (s[p] === '\\') { p += 2; continue; }
         if (s[p] === '`') {
           let m = 0;
           while (s[p + m] === '`') m++;
-          if (m === 1 || m === br.btPending) { deadDelim = br.btPending; break; }
+          if (m === br.btPending) { endLen = m; break; }
+          if (m === 1 && endLen === 0) endLen = 1;
           p += m;
         } else p++;
       }
+      if (endLen > 0) { deadDelim = br.btPending; deadEnd = endLen; }
     }
     return endPos;
   }
@@ -2018,7 +2023,7 @@ function parseInline(text, defs) {
       case '`': {
         let run = 0;
         while (s[i + run] === '`') run++;
-        if (deadDelim > 0 && (run === 1 || run === deadDelim)) {
+        if (deadDelim > 0 && run === deadEnd) {
           // this run ends the dead region and is lexed normally
           deadDelim = 0;
         }
