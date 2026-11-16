@@ -1673,17 +1673,23 @@ function parseInline(text, defs) {
   // Simulate marked's bracket search over the backtick runs in
   // s[from..to): a span opens at a run; a run of the same length closes
   // it; a shorter run is span content; a longer run closes it (excess
-  // discarded). Returns -1 when the bracket search fails (the ']' is
-  // swallowed: a length-1 span, a span containing a complete inner
-  // pair, or a span with no completed sibling and no backtick content
-  // at all); otherwise returns the length of the span still open at
-  // the end of the text (0 when every span closed).
+  // discarded). A closed span whose content holds an odd number of
+  // runs is "fragile". The bracket search fails (-1) when:
+  //  - a span of length 1 is still open at the end, unless an odd
+  //    number of fragile spans precede it;
+  //  - a span of length >= 2 is still open whose content holds a
+  //    positive even number of runs;
+  //  - content follows the last run (even just a space) and the
+  //    parity is wrong: with no open span, an odd number of fragile
+  //    spans; with an open span whose content is empty, an even
+  //    number of fragile spans before it.
+  // Otherwise returns the length of the span still open at the end
+  // (0 when every span closed).
   function linkTextBackticks(from, to) {
     let pending = 0;
-    let completed = 0;
-    let innerAny = false;
-    let innerPair = false;
-    const counts = new Map();
+    let inner = 0;
+    let fragile = 0;
+    let lastEnd = -1;
     let p = from;
     while (p < to) {
       const c = s[p];
@@ -1693,28 +1699,27 @@ function parseInline(text, defs) {
       while (p + m < to && s[p + m] === '`') m++;
       if (pending === 0) {
         pending = m;
-        innerAny = false;
-        innerPair = false;
-        counts.clear();
-      } else if (m === pending) {
+        inner = 0;
+      } else if (m >= pending) {
+        if (inner % 2 === 1) fragile++;
         pending = 0;
-        completed++;
-      } else if (m < pending) {
-        innerAny = true;
-        const c2 = (counts.get(m) || 0) + 1;
-        counts.set(m, c2);
-        if (c2 >= 2) innerPair = true;
+        inner = 0;
       } else {
-        pending = 0;
-        completed++;
+        inner++;
       }
       p += m;
+      lastEnd = p;
     }
-    if (pending === 0) return 0;
-    if (pending === 1) return -1;
-    if (innerPair) return -1;
-    if (completed === 0 && !innerAny) return -1;
-    return pending;
+    if (lastEnd < 0) return 0;
+    const trailing = to > lastEnd;
+    if (pending === 1) return fragile % 2 === 1 ? 1 : -1;
+    if (pending > 0) {
+      if (inner > 0 && inner % 2 === 0) return -1;
+      if (inner === 0 && trailing && fragile % 2 === 0) return -1;
+      return pending;
+    }
+    if (trailing && fragile % 2 === 1) return -1;
+    return 0;
   }
 
   // Find the ']' that closes the bracket whose text starts at `from`,
@@ -1767,6 +1772,20 @@ function parseInline(text, defs) {
     return nd.autoStart + url.length;
   }
 
+  // When marked's bracket search fails on the backtick runs in a
+  // link's text, every delimiter run inside that text stays inert.
+  function deadenBracketDelims(br) {
+    const oi = nodes.indexOf(br.node);
+    if (oi < 0) return;
+    for (let k = oi + 1; k < nodes.length; k++) {
+      const nd = nodes[k];
+      if (nd.k === 'delim') {
+        const raw = nd.ch.repeat(nd.runLen ?? nd.len);
+        nodes[k] = { k: 'text', html: escapeText(raw), plain: raw, seq: nd.seq };
+      }
+    }
+  }
+
   function tryLink(closeIdx) {
     if (bracketStack.length === 0) return -1;
     const br = bracketStack[bracketStack.length - 1];
@@ -1775,12 +1794,10 @@ function parseInline(text, defs) {
       return extendCappedAutolink(closeIdx);
     }
     // marked's bracket search can fail on backtick runs in the text:
-    // the ']' is then literal text, not a link close
+    // the ']' is then literal text, not a link close. The failure only
+    // applies to inline links and full references; collapsed and
+    // shortcut references still form.
     const btPending = linkTextBackticks(br.srcIdx + (br.isImage ? 2 : 1), closeIdx);
-    if (btPending < 0) {
-      bracketStack.pop();
-      return extendCappedAutolink(closeIdx);
-    }
     br.btPending = btPending;
     let dest = null;
     let title = null;
@@ -1789,6 +1806,11 @@ function parseInline(text, defs) {
     const after = closeIdx + 1;
     let formed = false;
     if (s[after] === '(') {
+      if (btPending < 0) {
+        deadenBracketDelims(br);
+        bracketStack.pop();
+        return extendCappedAutolink(closeIdx);
+      }
       // inline link
       let p = after + 1;
       // skip whitespace
@@ -1845,6 +1867,11 @@ function parseInline(text, defs) {
           // collapsed: label is the link text source
           labelText = s.slice(br.srcIdx + (br.isImage ? 2 : 1), closeIdx);
         } else if (normalizeLabel(lab) !== '') {
+          if (btPending < 0) {
+            deadenBracketDelims(br);
+            bracketStack.pop();
+            return extendCappedAutolink(closeIdx);
+          }
           labelText = lab;
         }
         if (labelText !== null) {
@@ -2176,7 +2203,7 @@ function parseInline(text, defs) {
         }
         flushBuf();
         const node = {
-          k: 'delim', ch: c, len: run, open: '', close: '',
+          k: 'delim', ch: c, len: run, runLen: run, open: '', close: '',
           plain: '', seq: NODE_SEQ++,
         };
         nodes.push(node);
