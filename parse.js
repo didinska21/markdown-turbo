@@ -231,6 +231,24 @@ function sliceExpanded(line, cols) {
 }
 
 /**
+ * Remove up to `cols` columns of indentation from a line, the way the
+ * fence tokenizer strips its own indent: a tab is always removed as a
+ * whole character, even when it straddles the boundary.
+ */
+function stripColsTabWhole(line, cols) {
+  if (cols <= 0) return line;
+  let col = 0;
+  let i = 0;
+  while (i < line.length && col < cols) {
+    const ch = line[i];
+    if (ch === ' ') { col += 1; i++; }
+    else if (ch === '\t') { col += 4 - (col % 4); i++; }
+    else break;
+  }
+  return line.slice(i);
+}
+
+/**
  * Remove up to `cols` columns of indentation from a line. A tab that
  * straddles the boundary is replaced by the spaces that remain of it.
  */
@@ -786,7 +804,7 @@ function lexBlocks(lines, start, end, ctx) {
       let closed = false;
       while (j < end) {
         if (isFenceClose(lines[j], fs.ch, fs.len)) { closed = true; break; }
-        content.push(stripCols(lines[j], fs.indentCols));
+        content.push(stripColsTabWhole(lines[j], fs.indentCols));
         j++;
       }
       // marked's fence capture is the raw text between the opening line
