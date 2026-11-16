@@ -1,0 +1,1 @@
+{"description":"A dependency-free JavaScript Markdown renderer that matches marked 18.1.3 output byte-for-byte (CommonMark 0.31.2 + GFM 0.29) while rendering much faster.","license":"MIT","main":"parse.js","name":"markdown-turbo","type":"module","version":"1.0.0"}
