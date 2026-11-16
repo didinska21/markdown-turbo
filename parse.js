@@ -1505,6 +1505,7 @@ function parseInline(text, defs) {
   // run of L backticks (which is itself literal): deadDelim tracks L
   let deadDelim = 0;
   let deadEnd = 0;
+  let deadGate = -1;
   // marked quirk: when a delimiter run that can both open and close forms
   // an em (use 1) pair that fully consumes a length-1 opener, the openers
   // below it become "guarded": a later closer of the same char cannot pair
@@ -2013,23 +2014,25 @@ function parseInline(text, defs) {
     if (armRegion && br.btPending > 0 && br.btTailInner % 2 === 1) {
       // a link whose text ends in an unterminated code span (with an
       // odd number of runs inside that span) leaves a region where
-      // delimiter runs are inert. The region ends at the first later
-      // backtick run of the pending length when one exists, else at
-      // the first later run of length 1; with neither, there is no
-      // region at all.
+      // delimiter runs are inert. The region runs until the LAST
+      // later backtick run of the pending length when one exists,
+      // else the last later run of length 1; with neither, there is
+      // no region at all.
       let p = endPos;
       let endLen = 0;
+      let endPosRun = -1;
       while (p < n) {
         if (s[p] === '\\') { p += 2; continue; }
         if (s[p] === '`') {
           let m = 0;
           while (s[p + m] === '`') m++;
-          if (m === br.btPending) { endLen = m; break; }
-          if (m === 1 && endLen === 0) endLen = 1;
+          if (m === br.btPending) { endLen = m; endPosRun = p; }
+          else if (m === 1 && endLen === 0) endPosRun = p;
           p += m;
         } else p++;
       }
-      if (endLen > 0) { deadDelim = br.btPending; deadEnd = endLen; }
+      if (endPosRun >= 0 && endLen === 0) endLen = 1;
+      if (endLen > 0) { deadDelim = br.btPending; deadEnd = endPosRun; }
     }
     return endPos;
   }
@@ -2086,10 +2089,6 @@ function parseInline(text, defs) {
       case '`': {
         let run = 0;
         while (s[i + run] === '`') run++;
-        if (deadDelim > 0 && run === deadEnd) {
-          // this run ends the dead region and is lexed normally
-          deadDelim = 0;
-        }
         // find closing run of exactly this length
         let j = i + run;
         let found = -1;
@@ -2111,6 +2110,12 @@ function parseInline(text, defs) {
           if (cand >= 0 && found >= cand && linkTextBackticks(textStart, cand).v >= 0) {
             found = -1;
           }
+        }
+        if (deadDelim > 0 && deadEnd >= i &&
+            deadEnd < (found >= 0 ? found + run : i + run)) {
+          // the span starting here contains the region's last run:
+          // the region ends and this span is lexed normally
+          deadDelim = 0;
         }
         if (found < 0) {
           buf += '`'.repeat(run);
