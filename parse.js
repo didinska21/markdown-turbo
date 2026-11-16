@@ -1526,6 +1526,43 @@ function parseInline(text, defs) {
 
   // -- emphasis processing over the delimiter stack, for entries whose node
   // seq is greater than floorSeq.
+  // a `_` pairing is rejected when a `**` run (exactly two stars, in
+  // live text or as a delimiter) sits between the opener and the
+  // closer and another `**` run appears later in the block: the
+  // closer stays unmatched and the opener survives for a later closer
+  function starRun2(text) {
+    for (let k = 0; k + 1 < text.length; k++) {
+      if (text[k] === '*' && text[k + 1] === '*' &&
+          text[k - 1] !== '*' && text[k + 2] !== '*') return true;
+    }
+    return false;
+  }
+  function underscoreBlocked(opener, closer, oiS, ciS) {
+    // an unmatched `**` run between the pair: either a live stack
+    // entry that has not been consumed, or an inert run in plain text
+    let between = false;
+    for (let k = oiS + 1; k < ciS; k++) {
+      const e = delimStack[k];
+      if (e.ch === '*' && e.node.runLen === 2 && e.node.len > 0) { between = true; break; }
+    }
+    const oi = nodes.indexOf(opener.node);
+    const ci = nodes.indexOf(closer.node);
+    if (oi < 0 || ci < 0) return false;
+    if (!between) {
+      for (let k = oi + 1; k < ci; k++) {
+        const nd = nodes[k];
+        if (nd.k === 'text' && starRun2(nd.plain)) { between = true; break; }
+      }
+    }
+    if (!between) return false;
+    for (let k = ci + 1; k < nodes.length; k++) {
+      const nd = nodes[k];
+      if (nd.k === 'text' && starRun2(nd.plain)) return true;
+      if (nd.k === 'delim' && nd.ch === '*' && nd.runLen === 2) return true;
+    }
+    return false;
+  }
+
   function processEmphasis(floorSeq) {
     // the poison state is local to one emphasis pass: a match made
     // while resolving a link's text must not affect the enclosing text
@@ -1546,6 +1583,10 @@ function parseInline(text, defs) {
       while (oi >= 0 && delimStack[oi].node.seq > floorSeq) {
         const opener = delimStack[oi];
         if (opener.ch === closer.ch && opener.canOpen && opener.node.len > 0) {
+          if (closer.ch === '_' && underscoreBlocked(opener, closer, oi, ci)) {
+            oi--;
+            continue;
+          }
           const pz = poison.get(closer.ch);
           if (pz && pz.guarded.has(opener) && closer.node !== pz.fromNode) {
             if (pz.caseB) {
