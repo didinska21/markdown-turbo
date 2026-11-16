@@ -1504,7 +1504,7 @@ function parseInline(text, defs) {
   // with a guarded length-2 opener while the budget lasts (budget starts
   // at 2 and is spent by the lengths of closers it blocks; a blocked
   // closer that can itself open does not spend budget)
-  let poison = null; // {ch, guarded: Set<entry>, budget}
+  let poison = new Map(); // per char: {guarded: Set<entry>, budget, caseB, fromNode}
   const bracketStack = []; // {node, isImage, active, srcIdx}
   let buf = '';
   let i = 0;
@@ -1523,7 +1523,7 @@ function parseInline(text, defs) {
     // the poison state is local to one emphasis pass: a match made
     // while resolving a link's text must not affect the enclosing text
     const savedPoison = poison;
-    poison = null;
+    poison = new Map();
     // find first closer above the floor
     let ci = 0;
     while (ci < delimStack.length) {
@@ -1539,17 +1539,17 @@ function parseInline(text, defs) {
       while (oi >= 0 && delimStack[oi].node.seq > floorSeq) {
         const opener = delimStack[oi];
         if (opener.ch === closer.ch && opener.canOpen && opener.node.len > 0) {
-          if (poison && closer.ch === poison.ch && poison.guarded.has(opener) &&
-              closer.node !== poison.fromNode) {
-            if (poison.caseB) {
+          const pz = poison.get(closer.ch);
+          if (pz && pz.guarded.has(opener) && closer.node !== pz.fromNode) {
+            if (pz.caseB) {
               // case B: the guarded opener is skipped for this closer
               // while budget lasts and the lengths sum to at most 3
-              if (poison.budget > 0 && closer.node.len + opener.node.len <= 3) {
+              if (pz.budget > 0 && closer.node.len + opener.node.len <= 3) {
                 poisonBlocked = true;
                 oi--;
                 continue;
               }
-            } else if (opener.node.len === 2 && closer.node.len <= poison.budget) {
+            } else if (opener.node.len === 2 && closer.node.len <= pz.budget) {
               poisonBlocked = true;
               break;
             }
@@ -1571,17 +1571,19 @@ function parseInline(text, defs) {
           const tag = closer.ch === '~' ? 'del' : use === 2 ? 'strong' : 'em';
           opener.node.len -= use;
           closer.node.len -= use;
-          if (closer.canOpen && opener.node.len === 0 &&
-              (use === 1 || (use === 2 && !opener.canClose))) {
-            poison = {
-              ch: closer.ch,
+          if (opener.node.len === 0 &&
+              ((closer.canOpen && (use === 1 || (use === 2 && !opener.canClose))) ||
+               (use === 2 && !opener.canClose &&
+                s[closer.node.pos + closer.node.runLen] === '~'))) {
+            poison.set(closer.ch, {
               guarded: new Set(delimStack.slice(0, oi)),
               budget: use === 2 ? 2 : (opener.canClose ? 1 : 2),
               caseB: use === 2,
               fromNode: closer.node,
-            };
+            });
           }
-          if (use === 2 && poison && poison.ch === closer.ch && poison.guarded.has(opener)) {
+          const pz2 = poison.get(closer.ch);
+          if (use === 2 && pz2 && pz2.guarded.has(opener)) {
             // a strong pairing that escapes the poison block consumes
             // the closer run from its right: leftover stars render inside
             closer.node.flip = true;
@@ -1599,10 +1601,11 @@ function parseInline(text, defs) {
           oi--;
         }
       }
-      if (poisonBlocked && poison && !matched) {
-        if (!closer.canOpen) {
-          poison.budget -= closer.node.len;
-          if (poison.budget <= 0) poison = null;
+      if (poisonBlocked && !matched) {
+        const pz3 = poison.get(closer.ch);
+        if (pz3 && !closer.canOpen) {
+          pz3.budget -= closer.node.len;
+          if (pz3.budget <= 0) poison.delete(closer.ch);
         }
         ci++;
         continue;
@@ -1787,6 +1790,14 @@ function parseInline(text, defs) {
       if (nd.k === 'delim') {
         const raw = nd.ch.repeat(nd.runLen ?? nd.len);
         nodes[k] = { k: 'text', html: escapeText(raw), plain: raw, seq: nd.seq };
+      } else if (nd.k === 'entity') {
+        nd.frozen = true;
+        for (const p of nd.parts) {
+          if (p.delim) {
+            const ix = delimStack.findIndex(e => e.node === p.delim);
+            if (ix >= 0) delimStack.splice(ix, 1);
+          }
+        }
       }
     }
   }
@@ -2220,7 +2231,7 @@ function parseInline(text, defs) {
         flushBuf();
         const node = {
           k: 'delim', ch: c, len: run, runLen: run, open: '', close: '',
-          plain: '', seq: NODE_SEQ++,
+          plain: '', seq: NODE_SEQ++, pos: i,
         };
         nodes.push(node);
         delimStack.push({ node, ch: c, canOpen, canClose });
@@ -2241,6 +2252,55 @@ function parseInline(text, defs) {
               nodes.push({ k: 'text', html: escapeCode(decoded.text), plain: decoded.text, seq: NODE_SEQ++ });
               i = decoded.end;
             }
+          } else if (deadDelim === 0 && /[*_~]/.test(ent)) {
+            // a named reference whose text contains a delimiter run
+            // only stands as an entity while that run stays unpaired;
+            // if the run pairs as emphasis, the reference breaks into
+            // ordinary text around the delimiter
+            flushBuf();
+            const parts = [];
+            let j = 0;
+            let hasDelim = false;
+            while (j < ent.length) {
+              const ch = ent[j];
+              if (ch === '*' || ch === '_' || ch === '~') {
+                let run = 0;
+                while (ent[j + run] === ch) run++;
+                const f = flanking(i + j, run);
+                let canOpen;
+                let canClose;
+                if (ch === '_') {
+                  canOpen = f.left && (!f.right || isPunct(f.before));
+                  canClose = f.right && (!f.left || isPunct(f.after));
+                } else {
+                  canOpen = f.left;
+                  canClose = f.right;
+                }
+                if ((canOpen || canClose) && !(ch === '~' && run > 2)) {
+                  const dn = {
+                    k: 'delim', ch, len: run, runLen: run, open: '', close: '',
+                    plain: '', seq: NODE_SEQ++, pos: i + j,
+                  };
+                  parts.push({ delim: dn });
+                  delimStack.push({ node: dn, ch, canOpen, canClose });
+                  hasDelim = true;
+                } else {
+                  parts.push({ text: ch.repeat(run) });
+                }
+                j += run;
+              } else {
+                let k2 = j;
+                while (k2 < ent.length && ent[k2] !== '*' && ent[k2] !== '_' && ent[k2] !== '~') k2++;
+                parts.push({ text: ent.slice(j, k2) });
+                j = k2;
+              }
+            }
+            if (hasDelim) {
+              nodes.push({ k: 'entity', raw: ent, plain: ent, parts, frozen: false, seq: NODE_SEQ++ });
+            } else {
+              nodes.push(rawNode(ent, ent));
+            }
+            i += ent.length;
           } else {
             flushBuf();
             nodes.push(rawNode(ent, ent));
@@ -2279,6 +2339,23 @@ function parseInline(text, defs) {
       out += nd.flip
         ? nd.ch.repeat(nd.len) + nd.close + nd.open
         : nd.close + nd.ch.repeat(nd.len) + nd.open;
+    } else if (nd.k === 'entity') {
+      const paired = !nd.frozen && nd.parts.some(p =>
+        p.delim && (p.delim.open || p.delim.close || p.delim.len !== p.delim.runLen));
+      if (!paired) {
+        out += nd.raw;
+      } else {
+        for (const p of nd.parts) {
+          if (p.delim) {
+            const d = p.delim;
+            out += d.flip
+              ? d.ch.repeat(d.len) + d.close + d.open
+              : d.close + d.ch.repeat(d.len) + d.open;
+          } else {
+            out += escapeText(p.text);
+          }
+        }
+      }
     } else {
       out += nd.html;
     }
@@ -2389,7 +2466,7 @@ function parseInline(text, defs) {
     if (!nd) return true;
     if (nd.k === 'delim') return true;
     if (nd.k === 'open') return false;
-    if (nd.k === 'text' || (nd.k === 'raw' && nd.plain.startsWith('&'))) {
+    if (nd.k === 'text' || ((nd.k === 'raw' || nd.k === 'entity') && nd.plain.startsWith('&'))) {
       const p = nd.plain;
       if (!p) return true;
       const c = p[p.length - 1];
