@@ -1548,11 +1548,13 @@ function parseInline(text, defs) {
   const nodes = [];
   const delimStack = []; // {node, ch, canOpen, canClose}
   // when a link's text ends inside an unterminated backtick span of
-  // length L, marked leaves every delimiter run inert until the next
-  // run of L backticks (which is itself literal): deadDelim tracks L
-  let deadDelim = 0;
-  let deadEnd = 0;
-  let deadGate = -1;
+  // length L (with an odd number of runs inside that span), delimiter
+  // pairs later in the paragraph are dead when BOTH runs start before
+  // deadZone: the start of the code span containing the last later
+  // run of length L (or of length 1 when no L run exists), or that
+  // run's own position when it is not inside a span
+  let deadZone = 0;
+  let deadFrom = 0;
   // marked quirk: when a delimiter run that can both open and close forms
   // an em (use 1) pair that fully consumes a length-1 opener, the openers
   // below it become "guarded": a later closer of the same char cannot pair
@@ -1631,6 +1633,13 @@ function parseInline(text, defs) {
       while (oi >= 0 && delimStack[oi].node.seq > floorSeq) {
         const opener = delimStack[oi];
         if (opener.ch === closer.ch && opener.canOpen && opener.node.len > 0) {
+          if (deadZone > 0 && closer.node.pos >= deadFrom &&
+              closer.node.pos < deadZone) {
+            // dead closer: the run sits inside the dead zone left
+            // by a fragile link text, so it cannot pair at all
+            oi--;
+            continue;
+          }
           if (closer.ch === '_' && underscoreBlocked(opener, closer, oi, ci)) {
             oi--;
             continue;
@@ -2093,18 +2102,37 @@ function parseInline(text, defs) {
       let p = endPos;
       let endLen = 0;
       let endPosRun = -1;
+      const runs = [];
       while (p < n) {
         if (s[p] === '\\') { p += 2; continue; }
         if (s[p] === '`') {
           let m = 0;
           while (s[p + m] === '`') m++;
+          runs.push([p, m]);
           if (m === br.btPending) { endLen = m; endPosRun = p; }
           else if (m === 1 && endLen === 0) endPosRun = p;
           p += m;
         } else p++;
       }
       if (endPosRun >= 0 && endLen === 0) endLen = 1;
-      if (endLen > 0) { deadDelim = br.btPending; deadEnd = endPosRun; }
+      if (endLen > 0) {
+        // find the boundary: the start of the span containing the
+        // last endLen run, or that run itself when it opens a span
+        let openStart = -1;
+        let openLen = 0;
+        let zone = endPosRun;
+        for (const [rp, rm] of runs) {
+          if (openStart < 0) {
+            if (rp === endPosRun) { zone = rp; break; }
+            openStart = rp; openLen = rm;
+          } else if (rm === openLen) {
+            if (rp === endPosRun) { zone = openStart; break; }
+            openStart = -1;
+          } else if (rp === endPosRun) { zone = openStart; break; }
+        }
+        deadZone = zone;
+        deadFrom = endPos;
+      }
     }
     return endPos;
   }
@@ -2182,12 +2210,6 @@ function parseInline(text, defs) {
           if (cand >= 0 && found >= cand && linkTextBackticks(textStart, cand).v >= 0) {
             found = -1;
           }
-        }
-        if (deadDelim > 0 && deadEnd >= i &&
-            deadEnd < (found >= 0 ? found + run : i + run)) {
-          // the span starting here contains the region's last run:
-          // the region ends and this span is lexed normally
-          deadDelim = 0;
         }
         if (found < 0) {
           buf += '`'.repeat(run);
@@ -2323,12 +2345,6 @@ function parseInline(text, defs) {
       case '~': {
         let run = 0;
         while (s[i + run] === c) run++;
-        if (deadDelim > 0) {
-          // inert inside a dead region (see deadDelim above)
-          buf += c.repeat(run);
-          i += run;
-          break;
-        }
         if (c === '~' && run > 2) {
           buf += '~'.repeat(run);
           i += run;
@@ -2377,7 +2393,7 @@ function parseInline(text, defs) {
               nodes.push({ k: 'text', html: escapeCode(decoded.text), plain: decoded.text, seq: NODE_SEQ++ });
               i = decoded.end;
             }
-          } else if (deadDelim === 0 && /[*_~]/.test(ent)) {
+          } else if (/[*_~]/.test(ent)) {
             // a named reference whose text contains a delimiter run
             // only stands as an entity while that run stays unpaired;
             // if the run pairs as emphasis, the reference breaks into
