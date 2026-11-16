@@ -1194,6 +1194,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
     const chunk = [];
     chunk.push(sliceExpanded(lines[k], contentCol));
     const lazyMarks = new Set();
+    const breakAfter = new Set();
     let hasContent = !isBlankLine(chunk[0]);
     let pendingBlanks = 0;
     let blankBetween = false;
@@ -1298,6 +1299,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
           const extra = Math.floor((w.cols - contentCol) / 4) * 4;
           frameLine = sliceExpanded(l, contentCol + extra);
           lazyMarks.add(chunk.length);
+          breakAfter.add(chunk.length);
         }
         chunk.push(frameLine);
         trackFence(frameLine);
@@ -1322,7 +1324,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
     // lex the item chunk
     const childCtx = {
       defs: ctx.defs, eofNl: false, inList: true,
-      indentLazy: null, breakAfter: null,
+      indentLazy: null, breakAfter: breakAfter.size ? breakAfter : null,
       forceContinue: lazyMarks.size ? lazyMarks : null,
       defSpans: [],
     };
