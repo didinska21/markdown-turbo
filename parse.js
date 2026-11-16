@@ -1029,8 +1029,12 @@ function lexHtmlBlock(lines, i, end, ctx, hb) {
   // marked keeps a trailing newline after the block when another block
   // follows immediately (no blank line between), or when the block reaches
   // the end of the (sub)document and that source ends with a newline.
+  // For terminator-ended blocks (types 1-5) a following line that is
+  // whitespace-only but not literally empty still counts as "follows".
   let raw = rawLines.join('\n');
-  if ((j < end && !isBlankLine(lines[j])) || (j === end && ctx.eofNl)) raw += '\n';
+  const termEnded = hb.type >= 1 && hb.type <= 5;
+  const follows = j < end && (termEnded ? lines[j] !== '' : !isBlankLine(lines[j]));
+  if (follows || (j === end && ctx.eofNl)) raw += '\n';
   return { block: { t: 'html', raw }, next: j };
 }
 
