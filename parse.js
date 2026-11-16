@@ -118,7 +118,8 @@ function unescapeString(s) {
 /** marked's href cleaning: encodeURI, with stray % un-escaped; null on error. */
 function cleanUrl(href) {
   try {
-    return encodeURI(href).replace(/%25/g, '%');
+    return encodeURI(href).replace(/%25/g, '%')
+      .replace(/\[/g, '%5B').replace(/\]/g, '%5D');
   } catch {
     return null;
   }
@@ -753,11 +754,13 @@ function finishMarker(line, w, markerChars, ordered, start, bullet) {
 }
 
 // Does this line interrupt a paragraph as a list start?
-function listInterrupts(line, inParagraph) {
+function listInterrupts(line, inList) {
   const m = listMarker(line);
   if (!m) return false;
   if (m.empty) return false;
-  if (m.ordered && m.start !== 1) return false;
+  // an ordered list interrupts a paragraph with any start number inside
+  // a list item; elsewhere only start 1 does
+  if (m.ordered && m.start !== 1 && !inList) return false;
   return true;
 }
 
@@ -898,7 +901,9 @@ function lexBlocks(lines, start, end, ctx) {
         let j = i + 2;
         while (j < end) {
           const l = lines[j];
-          if (isBlankLine(l)) break;
+          // a line of spaces plus exactly one tab is an (empty) row in
+          // marked, not a blank line
+          if (isBlankLine(l) && !/^[ ]*\t$/.test(l)) break;
           if (/^ {0,3}>/.test(l)) break;
           rows.push(splitRowCells(l));
           j++;
@@ -963,7 +968,7 @@ function lexParagraph(lines, i, end, ctx, hasNl) {
     if (atxHeading(l)) break;
     if (isHrLine(l)) break;
     if (/^ {0,3}>/.test(l)) break;
-    if (listInterrupts(l)) break;
+    if (listInterrupts(l, ctx.inList)) break;
     const hb = htmlBlockStart(l, false);
     if (hb && hb.type !== 7) break;
     textLines.push(l);
@@ -1043,10 +1048,10 @@ function tailOpenParagraph(blocks) {
 
 // Speculatively lex a chunk of lines and report whether it ends with an
 // open paragraph (for laziness checks). Uses a throwaway defs map.
-function chunkEndsWithOpenParagraph(chunkLines) {
+function chunkEndsWithOpenParagraph(chunkLines, inList) {
   if (chunkLines.length === 0) return false;
   const scratch = {
-    defs: new Map(), eofNl: false,
+    defs: new Map(), eofNl: false, inList: !!inList,
     indentLazy: null, breakAfter: null, forceContinue: null,
   };
   const blocks = lexBlocks(chunkLines, 0, chunkLines.length, scratch);
@@ -1061,7 +1066,7 @@ function isParaContinuation(line) {
   if (fenceStart(line)) return false;
   if (atxHeading(line)) return false;
   if (/^ {0,3}>/.test(line)) return false;
-  if (listInterrupts(line)) return false;
+  if (listInterrupts(line, false)) return false;
   const hb = htmlBlockStart(line, false);
   if (hb) return false;
   return true;
@@ -1104,7 +1109,7 @@ function lexBlockquote(lines, i, end, ctx) {
     if (inner.length === 0) break;
     if (isBlankLine(inner[inner.length - 1])) break;
     if (!isParaContinuation(line)) break;
-    if (!chunkEndsWithOpenParagraph(inner)) break;
+    if (!chunkEndsWithOpenParagraph(inner, false)) break;
     // accept the lazy line
     const idx = inner.length;
     const w = leadingWs(line);
@@ -1121,7 +1126,7 @@ function lexBlockquote(lines, i, end, ctx) {
     k++;
   }
   const childCtx = {
-    defs: ctx.defs, eofNl: false,
+    defs: ctx.defs, eofNl: false, inList: false,
     indentLazy, breakAfter, forceContinue,
     defSpans: [],
   };
@@ -1155,8 +1160,31 @@ function lexList(lines, i, end, ctx, firstMarker) {
     let j = k + 1;
     let itemDone = false;
     let listDone = false;
+    // marked keeps consuming lines into the item while a fenced code
+    // block is open, even lines that are not indented to the content
+    // column (the fence's body is part of the item's raw text)
+    let openFence = fenceStart(chunk[0]);
+    const trackFence = (frameLine) => {
+      if (openFence) {
+        if (isFenceClose(frameLine, openFence.ch, openFence.len)) openFence = null;
+      } else {
+        openFence = fenceStart(frameLine);
+      }
+    };
     while (j < end && !itemDone && !listDone) {
       const l = lines[j];
+      if (openFence) {
+        const w0 = leadingWs(l);
+        const frameLine = w0.cols >= contentCol
+          ? sliceExpanded(l, contentCol)
+          : stripCols(l, contentCol);
+        chunk.push(isBlankLine(l) ? '' : frameLine);
+        if (!isBlankLine(l)) trackFence(frameLine);
+        hasContent = true;
+        lastLine = j;
+        j++;
+        continue;
+      }
       if (isBlankLine(l)) { pendingBlanks++; j++; continue; }
       const w = leadingWs(l);
       // A thematic break ends the list outright (checked before the
@@ -1186,7 +1214,9 @@ function lexList(lines, i, end, ctx, firstMarker) {
       if (w.cols >= contentCol) {
         for (let b = 0; b < pendingBlanks; b++) chunk.push('');
         pendingBlanks = 0;
-        chunk.push(sliceExpanded(l, contentCol));
+        const frameLine = sliceExpanded(l, contentCol);
+        chunk.push(frameLine);
+        trackFence(frameLine);
         hasContent = true;
         lastLine = j;
         j++;
@@ -1195,7 +1225,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
       // lazy continuation (never across a blank line); the line's leading
       // whitespace is stripped up to the content column, and the line is
       // marked so the item's paragraph lexer treats it as plain text
-      if (pendingBlanks === 0 && isParaContinuation(l) && chunkEndsWithOpenParagraph(chunk)) {
+      if (pendingBlanks === 0 && isParaContinuation(l) && chunkEndsWithOpenParagraph(chunk, true)) {
         lazyMarks.add(chunk.length);
         chunk.push(stripCols(l, contentCol));
         lastLine = j;
@@ -1207,7 +1237,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
     if (blankBetween) loose = true;
     // lex the item chunk
     const childCtx = {
-      defs: ctx.defs, eofNl: false,
+      defs: ctx.defs, eofNl: false, inList: true,
       indentLazy: null, breakAfter: null,
       forceContinue: lazyMarks.size ? lazyMarks : null,
       defSpans: [],
@@ -1392,13 +1422,21 @@ function plainOfNodes(nodes) {
   return out;
 }
 
-const INTERESTING = new Set(['\\', '`', '<', '!', '[', ']', '*', '_', '~', '&', '\n', '@', 'w', 'h', 'f', 'm', 'x']);
-const EMAIL_LOCAL_CHARS = new Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.!#$%&'*+/=?^_`{|}~-");
+const INTERESTING = new Set(['\\', '`', '<', '!', '[', ']', '*', '_', '~', '&', '\n', '@', 'w', 'h', 'f', 'm', 'x', 'W', 'H', 'F', 'M', 'X']);
+const EMAIL_LOCAL_CHARS = new Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.+_-");
 
 function parseInline(text, defs) {
+  const docState = defs.docState || (defs.docState = { inLinkTag: false });
   const s = text;
   const nodes = [];
   const delimStack = []; // {node, ch, canOpen, canClose}
+  // marked quirk: when a delimiter run that can both open and close forms
+  // an em (use 1) pair that fully consumes a length-1 opener, the openers
+  // below it become "guarded": a later closer of the same char cannot pair
+  // with a guarded length-2 opener while the budget lasts (budget starts
+  // at 2 and is spent by the lengths of closers it blocks; a blocked
+  // closer that can itself open does not spend budget)
+  let poison = null; // {ch, guarded: Set<entry>, budget}
   const bracketStack = []; // {node, isImage, active, srcIdx}
   let buf = '';
   let i = 0;
@@ -1425,9 +1463,15 @@ function parseInline(text, defs) {
       // find nearest matching opener below ci
       let oi = ci - 1;
       let matched = false;
+      let poisonBlocked = false;
       while (oi >= 0 && delimStack[oi].node.seq > floorSeq) {
         const opener = delimStack[oi];
         if (opener.ch === closer.ch && opener.canOpen && opener.node.len > 0) {
+          if (poison && closer.ch === poison.ch && poison.guarded.has(opener) &&
+              opener.node.len === 2 && closer.node.len <= poison.budget) {
+            poisonBlocked = true;
+            break;
+          }
           // rule of 3: only when one of the runs can both open and close
           if ((closer.canOpen || opener.canClose) &&
               (opener.node.len + closer.node.len) % 3 === 0 &&
@@ -1445,6 +1489,13 @@ function parseInline(text, defs) {
           const tag = closer.ch === '~' ? 'del' : use === 2 ? 'strong' : 'em';
           opener.node.len -= use;
           closer.node.len -= use;
+          if (closer.canOpen && use === 1 && opener.node.len === 0) {
+            poison = {
+              ch: closer.ch,
+              guarded: new Set(delimStack.slice(0, oi)),
+              budget: opener.canClose ? 1 : 2,
+            };
+          }
           opener.node.open = '<' + tag + '>' + (opener.node.open || '');
           closer.node.close = (closer.node.close || '') + '</' + tag + '>';
           // delimiters between opener and closer are deactivated
@@ -1457,6 +1508,14 @@ function parseInline(text, defs) {
         } else {
           oi--;
         }
+      }
+      if (poisonBlocked && poison) {
+        if (!closer.canOpen) {
+          poison.budget -= closer.node.len;
+          if (poison.budget <= 0) poison = null;
+        }
+        ci++;
+        continue;
       }
       if (!matched) ci++;
       // if closer fully used, remove it
@@ -1484,8 +1543,68 @@ function parseInline(text, defs) {
     return { left, right, before, after };
   }
 
+  // True when a delimiter run starting at pos would close an emphasis
+  // that is currently open on the delimiter stack. Marked lexes the
+  // inside of an emphasis span as its own inline source, so an email
+  // or autolink candidate ends right before such a run.
+  function isCloserRunStart(pos) {
+    const c = s[pos];
+    if (c !== '*' && c !== '_' && c !== '~') return false;
+    let len = 1;
+    while (s[pos + len] === c) len++;
+    if (c === '~' && len > 2) return false;
+    const f = flanking(pos, len);
+    let canClose;
+    if (c === '_') canClose = f.right && (!f.left || isPunct(f.after));
+    else canClose = f.right;
+    if (!canClose) return false;
+    for (let k = delimStack.length - 1; k >= 0; k--) {
+      const d = delimStack[k];
+      if (d.ch === c && d.canOpen && d.node.len > 0) return true;
+    }
+    return false;
+  }
+
+  // Compute the final URL text of an extended autolink starting at
+  // `start` (s[start..] begins with the scheme/www prefix). When
+  // capAtBracket is set, the raw run stops before the first unescaped
+  // ']' (the bracket that may become a link must be able to close).
+  function scanAutolinkUrl(start, capAtBracket) {
+    let j = start;
+    while (j < n && !isWs(s[j]) && s[j] !== '<' && !isCloserRunStart(j)) {
+      if (capAtBracket && s[j] === ']' && s[j - 1] !== '\\') break;
+      j++;
+    }
+    let run = s.slice(start, j);
+    // a '(' with no ')' anywhere after it ends the URL just before it
+    const lastClose = run.lastIndexOf(')');
+    for (let k = 0; k < run.length; k++) {
+      if (run[k] === '(' && k > lastClose) { run = run.slice(0, k); break; }
+    }
+    return trimAutolinkUrl(run);
+  }
+
   // Try to form a link/image at a ']' (index i in s). Returns the new index
   // after the consumed construct, or -1 if not a link.
+  // When a bracket fails to form a link, an autolink node that was
+  // capped at this ']' extends over it (marked only suppresses the
+  // autolink while lexing the text of a link that actually forms).
+  // Returns the source position just past the extended URL, or -1.
+  function extendCappedAutolink(closeIdx) {
+    const nd = nodes[nodes.length - 1];
+    if (nd && nd.auto && nd.autoCapEnd === closeIdx) {
+      const url = scanAutolinkUrl(nd.autoStart, false);
+      if (url.length > nd.plain.length) {
+        const href = nd.autoKind === 'www' ? 'http://' + url : url;
+        nd.html = '<a href="' + escapeText(cleanUrl(href) ?? href) + '">' + escapeText(url) + '</a>';
+        nd.plain = url;
+        nd.autoCapEnd = -1;
+        return nd.autoStart + url.length;
+      }
+    }
+    return -1;
+  }
+
   function tryLink(closeIdx) {
     if (bracketStack.length === 0) return -1;
     const br = bracketStack[bracketStack.length - 1];
@@ -1560,7 +1679,7 @@ function parseInline(text, defs) {
         }
         if (labelText !== null) {
           const def = defs.get(normalizeLabel(labelText));
-          if (!def) { bracketStack.pop(); return -1; }
+          if (!def) { bracketStack.pop(); return extendCappedAutolink(closeIdx); }
           dest = def.dest;
           title = def.title;
           endPos = j + 1;
@@ -1574,7 +1693,7 @@ function parseInline(text, defs) {
       // shortcut reference (labels match on their raw source text)
       labelText = s.slice(br.srcIdx + (br.isImage ? 2 : 1), closeIdx);
       const def = defs.get(normalizeLabel(labelText));
-      if (!def) { bracketStack.pop(); return -1; }
+      if (!def) { bracketStack.pop(); return extendCappedAutolink(closeIdx); }
       dest = def.dest;
       title = def.title;
       endPos = after;
@@ -1601,6 +1720,14 @@ function parseInline(text, defs) {
         nodes.push(rawNode(html, alt));
       }
     } else {
+      // extended autolinks do not form inside link text: revert any
+      // created while scanning this bracket's content to plain text
+      for (let k = openerIdx + 1; k < nodes.length; k++) {
+        const nd = nodes[k];
+        if (nd.auto) {
+          nodes[k] = { k: 'text', html: escapeText(nd.plain), plain: nd.plain, seq: nd.seq };
+        }
+      }
       // deactivate earlier link openers
       for (const b2 of bracketStack) {
         if (!b2.isImage) b2.active = false;
@@ -1765,7 +1892,13 @@ function parseInline(text, defs) {
             const tag = scanHtmlTag(s, i);
             if (tag && tag.complete) {
               flushBuf();
-              nodes.push(rawNode(s.slice(i, tag.end), ''));
+              const tagText = s.slice(i, tag.end);
+              // marked leaks its inLink state across the whole document:
+              // an inline <a ...> tag suppresses extended autolinks until
+              // an exact </a> is seen
+              if (/^<a /i.test(tagText)) docState.inLinkTag = true;
+              else if (/^<\/a>$/i.test(tagText)) docState.inLinkTag = false;
+              nodes.push(rawNode(tagText, ''));
               i = tag.end;
             } else {
               buf += '<';
@@ -1829,6 +1962,12 @@ function parseInline(text, defs) {
         } else {
           canOpen = f.left;
           canClose = f.right;
+        }
+        if (!canOpen && !canClose) {
+          // a run that can neither open nor close is plain text
+          buf += c.repeat(run);
+          i += run;
+          break;
         }
         flushBuf();
         const node = {
@@ -1904,78 +2043,66 @@ function parseInline(text, defs) {
   // The local part may span inert delimiter nodes (a literal '_' or '~'
   // run) and the tail of the current text buffer.
   function tryEmailAutolink() {
+    if (docState.inLinkTag) return false;
+    // Local part: maximal run of [A-Za-z0-9.+_-] ending at the '@' in
+    // the source. An escaped char belongs to an escape token, so the
+    // run stops before it (the email starts after that token).
     let ls = i;
-    while (ls > 0 && EMAIL_LOCAL_CHARS.has(s[ls - 1])) ls--;
+    while (ls > 0 && EMAIL_LOCAL_CHARS.has(s[ls - 1])) {
+      const p = ls - 1;
+      let bs = 0;
+      let q = p - 1;
+      while (q >= 0 && s[q] === '\\') { bs++; q--; }
+      if (bs % 2 === 1) break;
+      ls = p;
+    }
     if (ls === i) return false;
-    const local = s.slice(ls, i);
-    if (ls >= 2 && s[ls - 1] === '\\' && EMAIL_LOCAL_CHARS.has(s[ls - 2])) return false;
-    // Plan how to absorb a target string (scheme + local, or just local)
-    // from the tail of the output stream. Returns null when the target is
-    // not sitting verbatim at the tail.
-    function planTail(target) {
-      let need = target.length - buf.length;
-      if (need <= 0) {
-        return buf.endsWith(target)
-          ? { bufKeep: buf.length - target.length, dropFrom: nodes.length, split: null, prev: null }
-          : null;
-      }
-      let k = nodes.length;
-      let acc = '';
-      let split = null;
-      while (need > 0 && k > 0) {
-        const nd = nodes[k - 1];
-        let p = null;
-        if (nd.k === 'text') p = nd.plain;
-        else if (nd.k === 'delim' && (nd.ch === '_' || nd.ch === '~')) p = nd.ch.repeat(nd.len);
-        else return null; // any other node is a barrier
-        if (p.length <= need) {
-          acc = p + acc;
-          need -= p.length;
-          k--;
-        } else {
-          if (nd.k !== 'text') return null;
-          const head = p.slice(0, p.length - need);
-          acc = p.slice(p.length - need) + acc;
-          split = { idx: k - 1, head };
-          need = 0;
-          k--;
-          break;
+    const runLocal = s.slice(ls, i);
+    // The candidate (optional scheme + local) must sit verbatim at the
+    // tail of the plain buffer; when the source run reaches back
+    // across a token boundary (delimiter, escape, ...), only the
+    // suffix of the run that lies inside the buffer can be the local
+    // part. A scheme is rejected when an alphanumeric precedes it.
+    let scheme = null;
+    let local = null;
+    let bufKeep = 0;
+    for (let cand = runLocal; cand.length > 0 && scheme === null; cand = cand.slice(1)) {
+      for (const sch of ['mailto:', 'xmpp:', '']) {
+        const target = sch + cand;
+        if (buf.length < target.length || !buf.endsWith(target)) continue;
+        if (sch) {
+          const prev = buf.length > target.length
+            ? buf[buf.length - target.length - 1]
+            : lastPlainChar();
+          if (/[A-Za-z0-9]/.test(prev)) continue;
         }
+        scheme = sch;
+        local = cand;
+        bufKeep = buf.length - target.length;
+        break;
       }
-      if (need > 0 || acc + buf !== target) return null;
-      return { bufKeep: 0, dropFrom: k, split, prev: null };
     }
-    let scheme = '';
-    let plan = planTail('mailto:' + local);
-    if (plan) scheme = 'mailto:';
-    else {
-      plan = planTail('xmpp:' + local);
-      if (plan) scheme = 'xmpp:';
-      else plan = planTail(local);
-    }
-    if (!plan) return false;
-    // boundary: the character just before the absorbed candidate
-    let prev;
-    if (plan.bufKeep > 0) prev = buf[plan.bufKeep - 1];
-    else if (plan.split && plan.split.head) prev = plan.split.head[plan.split.head.length - 1];
-    else if (plan.dropFrom > 0) {
-      const nd = nodes[plan.dropFrom - 1];
-      const p = nd.k === 'delim' ? nd.ch : (nd.plain || '');
-      prev = p ? p[p.length - 1] : '';
-    } else prev = lastPlainChar();
-    if (!(prev === '' || isWs(prev) || '*_~([{"\'<'.includes(prev))) return false;
-    // domain: maximal run of [A-Za-z0-9._-]
+    if (scheme === null) return false;
+    // Domain: maximal run of [A-Za-z0-9._-], cut back to the longest
+    // prefix of dot-separated labels that each end in an alphanumeric
+    // (regex-backtracking semantics); at least two labels are needed.
     let de = i + 1;
-    while (de < n && /[A-Za-z0-9._-]/.test(s[de])) de++;
-    let dom = s.slice(i + 1, de);
-    let used = dom.length;
-    if (dom.endsWith('.')) { dom = dom.slice(0, -1); used--; }
-    if (dom === '') return false;
-    const labels = dom.split('.');
-    if (labels.length < 2) return false;
-    for (const lab of labels) {
-      if (!/^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/.test(lab)) return false;
+    while (de < n && /[A-Za-z0-9._-]/.test(s[de]) && !isCloserRunStart(de)) de++;
+    const runDom = s.slice(i + 1, de);
+    let used = 0;
+    let labels = 0;
+    let pos = 0;
+    while (pos < runDom.length) {
+      const dot = runDom.indexOf('.', pos);
+      const lab = dot === -1 ? runDom.slice(pos) : runDom.slice(pos, dot);
+      if (!/^[A-Za-z0-9_-]*[A-Za-z0-9]$/.test(lab)) break;
+      labels++;
+      used = dot === -1 ? runDom.length : dot;
+      if (dot === -1) break;
+      pos = dot + 1;
     }
+    if (labels < 2) return false;
+    const dom = runDom.slice(0, used);
     let endPos = i + 1 + used;
     let resource = '';
     if (scheme === 'xmpp:' && s[endPos] === '/') {
@@ -1988,35 +2115,18 @@ function parseInline(text, defs) {
     }
     const text = scheme + local + '@' + dom + resource;
     const href = scheme ? text : 'mailto:' + text;
-    // absorb the candidate: drop fully covered nodes (and any delimiter
-    // stack entries pointing at them), split a partially covered text
-    // node, and trim the buffer
-    for (let k = plan.dropFrom; k < nodes.length; k++) {
-      const nd = nodes[k];
-      if (nd.k === 'delim') {
-        const di = delimStack.findIndex(d => d.node === nd);
-        if (di >= 0) delimStack.splice(di, 1);
-      }
-    }
-    nodes.length = plan.dropFrom;
-    if (plan.split) {
-      const old = nodes[plan.split.idx];
-      nodes.push({
-        k: 'text',
-        html: escapeText(plan.split.head),
-        plain: plan.split.head,
-        seq: old.seq,
-      });
-    }
-    buf = buf.slice(0, plan.bufKeep);
+    buf = buf.slice(0, bufKeep);
     flushBuf();
-    nodes.push(rawNode('<a href="' + escapeText(href) + '">' + escapeText(text) + '</a>', text));
+    const emNode = rawNode('<a href="' + escapeText(href) + '">' + escapeText(text) + '</a>', text);
+    emNode.auto = true;
+    nodes.push(emNode);
     i = endPos;
     return true;
   }
 
   // GFM extended autolinks starting at position i (c is s[i]).
   function tryExtendedAutolink() {
+    if (docState.inLinkTag) return false;
     // boundary: previous emitted char must be start, whitespace or one of
     // the delimiter characters * _ ~ ( [ { " ' <
     const prev = buf.length > 0 ? buf[buf.length - 1] : (nodes.length > 0 ? lastPlainChar() : '');
@@ -2024,17 +2134,20 @@ function parseInline(text, defs) {
     const rest = s.slice(i);
     let kind = null;
     let prefixLen = 0;
+    // the URL schemes match case-insensitively (href keeps the source
+    // case); 'www.' is case-sensitive
+    const head = rest.slice(0, 8).toLowerCase();
     if (rest.startsWith('www.')) { kind = 'www'; prefixLen = 4; }
-    else if (rest.startsWith('http://')) { kind = 'url'; prefixLen = 7; }
-    else if (rest.startsWith('https://')) { kind = 'url'; prefixLen = 8; }
-    else if (rest.startsWith('ftp://')) { kind = 'url'; prefixLen = 6; }
+    else if (head.startsWith('http://')) { kind = 'url'; prefixLen = 7; }
+    else if (head.startsWith('https://')) { kind = 'url'; prefixLen = 8; }
+    else if (head.startsWith('ftp://')) { kind = 'url'; prefixLen = 6; }
     else return false;
-    // consume until whitespace or '<'
-    let j = i;
-    while (j < n && !isWs(s[j]) && s[j] !== '<') j++;
-    let url = s.slice(i, j);
-    // www / url: trim trailing punctuation
-    url = trimAutolinkUrl(url);
+    // consume the URL (balanced-paren rules inside scanAutolinkUrl);
+    // inside an open bracket the run stops before the closing ']' so
+    // the bracket can close — if the link then fails, the node is
+    // extended over the ']' (see tryLink)
+    const capped = bracketStack.length > 0;
+    const url = scanAutolinkUrl(i, capped);
     if (url.length <= prefixLen) return false;
     if (kind === 'www') {
       const host = url.slice(4).split('/')[0];
@@ -2042,7 +2155,12 @@ function parseInline(text, defs) {
     }
     const href = kind === 'www' ? 'http://' + url : url;
     flushBuf();
-    nodes.push(rawNode('<a href="' + escapeText(href) + '">' + escapeText(url) + '</a>', url));
+    const auNode = rawNode('<a href="' + escapeText(cleanUrl(href) ?? href) + '">' + escapeText(url) + '</a>', url);
+    auNode.auto = true;
+    auNode.autoStart = i;
+    auNode.autoKind = kind;
+    auNode.autoCapEnd = capped ? i + url.length : -1;
+    nodes.push(auNode);
     i = i + url.length;
     return true;
   }
@@ -2073,18 +2191,28 @@ function trimAutolinkUrl(url) {
       continue;
     }
     if (last === ')') {
-      let open = 0;
-      let close = 0;
-      for (const ch of u) {
-        if (ch === '(') open++;
-        else if (ch === ')') close++;
+      // a trailing ')' is dropped when it is unmatched, or when the
+      // group it closes itself contains a nested group
+      let depth = 0;
+      let match = -1;
+      for (let k = u.length - 1; k >= 0; k--) {
+        if (u[k] === ')') depth++;
+        else if (u[k] === '(') {
+          depth--;
+          if (depth === 0) { match = k; break; }
+        }
       }
-      if (close > open) { u = u.slice(0, -1); continue; }
+      if (match === -1) { u = u.slice(0, -1); continue; }
+      if (u.slice(match + 1, u.length - 1).includes('(')) {
+        u = u.slice(0, -1);
+        continue;
+      }
     }
     break;
   }
   return u;
 }
+
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -2098,7 +2226,7 @@ export function parse(markdown) {
   if (eofNl) lines.pop();
   if (lines.length === 1 && lines[0] === '' && src === '') lines = [];
   const ctx = {
-    defs: new Map(), eofNl,
+    defs: new Map(), eofNl, inList: false,
     indentLazy: null, breakAfter: null, forceContinue: null,
     defSpans: [],
   };
