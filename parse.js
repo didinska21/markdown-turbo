@@ -1086,6 +1086,23 @@ function chunkEndsWithTopParagraph(chunkLines, inList) {
   return blocks.length > 0 && blocks[blocks.length - 1].t === 'paragraph';
 }
 
+// Whether the chunk's trailing top-level block is a paragraph that
+// follows a nested list block (the extra indent strip for paragraph
+// continuation lines does not apply to such paragraphs).
+function chunkParaFollowsList(chunkLines, inList) {
+  if (chunkLines.length === 0) return false;
+  const scratch = {
+    defs: new Map(), eofNl: false, inList: !!inList,
+    indentLazy: null, breakAfter: null, forceContinue: null,
+  };
+  const blocks = lexBlocks(chunkLines, 0, chunkLines.length, scratch);
+  if (blocks.length === 0 || blocks[blocks.length - 1].t !== 'paragraph') return false;
+  for (let b = 0; b + 1 < blocks.length; b++) {
+    if (blocks[b].t === 'list') return true;
+  }
+  return false;
+}
+
 // Speculatively lex a chunk of lines and report whether it ends with an
 // open paragraph (for laziness checks). Uses a throwaway defs map.
 function chunkEndsWithOpenParagraph(chunkLines, inList) {
@@ -1295,7 +1312,8 @@ function lexList(lines, i, end, ctx, firstMarker) {
         // line's indent that is congruent to contentCol mod 4
         if (!hadBlanks && w.cols - contentCol >= 4 &&
             isParaContinuation(frameLine) &&
-            chunkEndsWithTopParagraph(chunk, true)) {
+            chunkEndsWithTopParagraph(chunk, true) &&
+            !chunkParaFollowsList(chunk, true)) {
           const extra = Math.floor((w.cols - contentCol) / 4) * 4;
           frameLine = sliceExpanded(l, contentCol + extra);
           lazyMarks.add(chunk.length);
