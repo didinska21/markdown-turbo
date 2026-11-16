@@ -231,20 +231,15 @@ function sliceExpanded(line, cols) {
 }
 
 /**
- * Remove up to `cols` columns of indentation from a line, the way the
- * fence tokenizer strips its own indent: a tab is always removed as a
- * whole character, even when it straddles the boundary.
+ * Remove up to `n` leading whitespace characters from a line, the way
+ * the fence tokenizer strips its own indent from body lines: spaces
+ * and tabs each count as one character, and stripping stops at the
+ * first non-whitespace character.
  */
-function stripColsTabWhole(line, cols) {
-  if (cols <= 0) return line;
-  let col = 0;
+function stripColsTabWhole(line, n) {
+  if (n <= 0) return line;
   let i = 0;
-  while (i < line.length && col < cols) {
-    const ch = line[i];
-    if (ch === ' ') { col += 1; i++; }
-    else if (ch === '\t') { col += 4 - (col % 4); i++; }
-    else break;
-  }
+  while (i < n && i < line.length && (line[i] === ' ' || line[i] === '\t')) i++;
   return line.slice(i);
 }
 
@@ -1393,10 +1388,10 @@ function lexList(lines, i, end, ctx, firstMarker) {
         chunk.push(isBlankLine(l) ? '' : frameLine);
         if (!isBlankLine(l)) {
           if (w0.cols >= contentCol) fenceStarted = true;
-          fencePrevIndent = leadingWs(frameLine).cols;
+          const fw = leadingWs(frameLine);
+          fencePrevIndent = fw.cols;
           const hb = htmlBlockStart(frameLine, true);
           fencePrevHtml = hb !== null && hb.type <= 6;
-          const fw = leadingWs(frameLine);
           fencePrevRun = fw.cols <= 3 &&
             (frameLine.startsWith('```', fw.end) || frameLine.startsWith('~~~', fw.end));
           fencePrevBlock = atxHeading(frameLine) !== null || isHrLine(frameLine);
@@ -1410,9 +1405,14 @@ function lexList(lines, i, end, ctx, firstMarker) {
       if (isBlankLine(l)) { pendingBlanks++; j++; continue; }
       const w = leadingWs(l);
       // A thematic break ends the list outright (checked before the
-      // next-item test: `* * *` is a break, not an item).
-      if (w.cols < contentCol && isHrLine(l)) { listDone = true; break; }
-      const lm = w.cols < contentCol ? listMarker(l) : null;
+      // next-item test: `* * *` is a break, not an item). Both breaks
+      // and list markers begin with one of a few characters; other
+      // lines skip both checks.
+      const c0 = l[w.end];
+      const markerish = c0 === '-' || c0 === '*' || c0 === '+' || c0 === '_' ||
+        (c0 >= '0' && c0 <= '9');
+      if (w.cols < contentCol && markerish && isHrLine(l)) { listDone = true; break; }
+      const lm = w.cols < contentCol && markerish ? listMarker(l) : null;
       // A sibling marker may sit at any base column below this item's
       // content column (indented more deeply it would be item content).
       const isSibling = lm !== null && sameFamily(lm, marker) && lm.baseCol < contentCol;
@@ -1442,13 +1442,14 @@ function lexList(lines, i, end, ctx, firstMarker) {
         // deeper in marked: the strip is the largest amount <= the
         // line's indent that is congruent to contentCol mod 4
         if (!hadBlanks && w.cols - contentCol >= 4 &&
-            isParaContinuation(frameLine) &&
-            chunkTailInfo(chunk, true, ctx.tailCache, ctx.tailMemo).topPara &&
-            !chunkTailInfo(chunk, true, ctx.tailCache, ctx.tailMemo).followsList) {
+            (firstBlockChar(frameLine) !== null || isParaContinuation(frameLine))) {
+          const ti = chunkTailInfo(chunk, true, ctx.tailCache, ctx.tailMemo);
+          if (ti.topPara && !ti.followsList) {
           const extra = Math.floor((w.cols - contentCol) / 4) * 4;
           frameLine = sliceExpanded(l, contentCol + extra);
           lazyMarks.add(chunk.length);
           breakAfter.add(chunk.length);
+          }
         }
         chunk.push(frameLine);
         trackFence(frameLine);
@@ -1462,7 +1463,9 @@ function lexList(lines, i, end, ctx, firstMarker) {
       // line is marked so the item's paragraph lexer treats it as text.
       // A line starting with a backtick run is never lazy, even when
       // the run is not a valid fence (backticks in the info string).
-      if (pendingBlanks === 0 && isParaContinuation(l) && chunkTailInfo(chunk, true, ctx.tailCache, ctx.tailMemo).openPara &&
+      if (pendingBlanks === 0 &&
+          (firstBlockChar(l) !== null || isParaContinuation(l)) &&
+          chunkTailInfo(chunk, true, ctx.tailCache, ctx.tailMemo).openPara &&
           !(w.cols <= 3 && l.startsWith('```', w.end))) {
         lazyMarks.add(chunk.length);
         if (setextLevel(l) > 0) setextLazy.add(chunk.length);
@@ -1840,7 +1843,7 @@ function parseInline(text, defs) {
           closer.node.len -= use;
           if (opener.node.len === 0 &&
               ((closer.canOpen && (use === 1 || (use === 2 && !opener.canClose))) ||
-               (use === 2 && !opener.canClose &&
+               (use === 2 && closer.ch === '*' && !opener.canClose &&
                 s[closer.node.pos + closer.node.runLen] === '~'))) {
             poison.set(closer.ch, {
               guarded: new Set(delimStack.slice(0, oi)),
