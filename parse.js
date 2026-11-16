@@ -804,7 +804,9 @@ function lexBlocks(lines, start, end, ctx) {
       let closed = false;
       while (j < end) {
         if (isFenceClose(lines[j], fs.ch, fs.len)) { closed = true; break; }
-        content.push(stripColsTabWhole(lines[j], fs.indentCols));
+        // marked strips the fence's indent from body lines of backtick
+        // fences only; tilde fence bodies keep their indentation
+        content.push(fs.ch === '`' ? stripColsTabWhole(lines[j], fs.indentCols) : lines[j]);
         j++;
       }
       // marked's fence capture is the raw text between the opening line
