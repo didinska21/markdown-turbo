@@ -1811,11 +1811,14 @@ function parseInline(text, defs) {
     let inner = 0;
     let fragile = 0;
     let lastEnd = -1;
+    let depth = 0;
     let p = from;
     while (p < to) {
       const c = s[p];
       if (c === '\\') { p += 2; continue; }
-      if (c !== '`') { p++; continue; }
+      if (c === '[') { depth++; p++; continue; }
+      if (c === ']') { if (depth > 0) depth--; p++; continue; }
+      if (c !== '`' || depth > 0) { p++; continue; }
       let m = 0;
       while (p + m < to && s[p + m] === '`') m++;
       if (pending === 0) {
