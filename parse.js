@@ -1180,22 +1180,34 @@ function lexList(lines, i, end, ctx, firstMarker) {
     // block is open, even lines that are not indented to the content
     // column (the fence's body is part of the item's raw text)
     let openFence = fenceStart(chunk[0]);
+    // a fence body line that is not indented to the content column is
+    // only kept once an indented body line has started the body; if the
+    // first body line is unindented the fence ends the item (empty)
+    let fenceStarted = false;
     const trackFence = (frameLine) => {
       if (openFence) {
         if (isFenceClose(frameLine, openFence.ch, openFence.len)) openFence = null;
       } else {
         openFence = fenceStart(frameLine);
+        fenceStarted = false;
       }
     };
     while (j < end && !itemDone && !listDone) {
       const l = lines[j];
       if (openFence) {
         const w0 = leadingWs(l);
+        if (!isBlankLine(l) && w0.cols < contentCol && !fenceStarted) {
+          listDone = true;
+          break;
+        }
         const frameLine = w0.cols >= contentCol
           ? sliceExpanded(l, contentCol)
           : stripCols(l, contentCol);
         chunk.push(isBlankLine(l) ? '' : frameLine);
-        if (!isBlankLine(l)) trackFence(frameLine);
+        if (!isBlankLine(l)) {
+          if (w0.cols >= contentCol) fenceStarted = true;
+          trackFence(frameLine);
+        }
         hasContent = true;
         lastLine = j;
         j++;
