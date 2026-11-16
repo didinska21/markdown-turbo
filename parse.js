@@ -1862,6 +1862,26 @@ function parseInline(text, defs) {
     if (bracketStack.length === 0) return -1;
     const br = bracketStack[bracketStack.length - 1];
     if (!br.active) {
+      // a bracket deactivated by a collapsed reference inside it has
+      // its delimiters deadened when it is then closed as a full
+      // reference with a defined label
+      if (br.innerCollapsed && s[closeIdx + 1] === '[') {
+        let j = closeIdx + 2;
+        let depth = 1;
+        let lab = '';
+        while (j < n && depth > 0) {
+          const c = s[j];
+          if (c === '\\' && j + 1 < n) { lab += c + s[j + 1]; j += 2; continue; }
+          if (c === '[') depth++;
+          if (c === ']') depth--;
+          if (depth > 0) lab += c;
+          j++;
+        }
+        if (depth === 0 && lab !== '' && normalizeLabel(lab) !== '' &&
+            defs.has(normalizeLabel(lab))) {
+          deadenBracketDelims(br);
+        }
+      }
       bracketStack.pop();
       return extendCappedAutolink(closeIdx);
     }
@@ -1877,6 +1897,7 @@ function parseInline(text, defs) {
     let title = null;
     let endPos = -1;
     let armRegion = false; // inline links and collapsed refs only
+    let wasCollapsed = false;
     let labelText = null; // for ref lookups
     const after = closeIdx + 1;
     let formed = false;
@@ -1942,6 +1963,7 @@ function parseInline(text, defs) {
           // collapsed: label is the link text source
           labelText = s.slice(br.srcIdx + (br.isImage ? 2 : 1), closeIdx);
           armRegion = true;
+          wasCollapsed = true;
         } else if (normalizeLabel(lab) !== '') {
           if (btPending < 0) {
             deadenBracketDelims(br);
@@ -2003,7 +2025,10 @@ function parseInline(text, defs) {
       }
       // deactivate earlier link openers
       for (const b2 of bracketStack) {
-        if (!b2.isImage) b2.active = false;
+        if (!b2.isImage) {
+          b2.active = false;
+          if (wasCollapsed) b2.innerCollapsed = true;
+        }
       }
       if (href === null) {
         // children only: drop the opener marker
