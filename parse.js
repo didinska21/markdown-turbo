@@ -1809,6 +1809,7 @@ function parseInline(text, defs) {
     let dest = null;
     let title = null;
     let endPos = -1;
+    let armRegion = false; // inline links and collapsed refs only
     let labelText = null; // for ref lookups
     const after = closeIdx + 1;
     let formed = false;
@@ -1850,7 +1851,7 @@ function parseInline(text, defs) {
           }
         }
       }
-      if (endPos >= 0) formed = true;
+      if (endPos >= 0) { formed = true; armRegion = true; }
       // a failed inline parse falls through to the shortcut reference
     }
     if (!formed && s[after] === '[') {
@@ -1873,6 +1874,7 @@ function parseInline(text, defs) {
         if (lab === '') {
           // collapsed: label is the link text source
           labelText = s.slice(br.srcIdx + (br.isImage ? 2 : 1), closeIdx);
+          armRegion = true;
         } else if (normalizeLabel(lab) !== '') {
           if (btPending < 0) {
             deadenBracketDelims(br);
@@ -1949,7 +1951,7 @@ function parseInline(text, defs) {
         // after the opener) — correct because ']' is the current position.
       }
     }
-    if (br.btPending > 0 && br.btTailInner % 2 === 1) {
+    if (armRegion && br.btPending > 0 && br.btTailInner % 2 === 1) {
       // a link whose text ends in an unterminated code span (with an
       // odd number of runs inside that span) leaves a region where
       // delimiter runs are inert. The region ends at the first later
