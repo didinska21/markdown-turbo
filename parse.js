@@ -176,22 +176,53 @@ function sliceFromCol(line, cols) {
   return line.slice(i);
 }
 
+/** Expand a whitespace run starting at index i (column col) to spaces. */
+function expandWsRun(line, i, col) {
+  let out = '';
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t')) {
+    if (line[i] === ' ') { out += ' '; col++; i++; }
+    else {
+      const w = 4 - (col % 4);
+      out += ' '.repeat(w);
+      col += w;
+      i++;
+    }
+  }
+  return out + line.slice(i);
+}
+
 /**
- * Like stripCols, but a tab counts as exactly 4 columns wherever it sits.
- * This is how marked's indented-code rule behaves: it peels a flat four
- * columns off the front of the line.
+ * Slice a line from column `cols` the way marked's container stripping
+ * behaves: characters (markers included) count one column each, tabs count
+ * to the next multiple of 4, and when the cut falls inside the leading
+ * whitespace run, the remainder of that run is expanded to spaces using
+ * the original column widths. The rest of the line is verbatim.
  */
-function stripColsFlat(line, cols) {
+function sliceExpanded(line, cols) {
   if (cols <= 0) return line;
   let col = 0;
   let i = 0;
   while (i < line.length && col < cols) {
     const ch = line[i];
-    if (ch === ' ') { col += 1; i++; }
-    else if (ch === '\t') {
-      if (col + 4 <= cols) { col += 4; i++; }
-      else return ' '.repeat(col + 4 - cols) + line.slice(i + 1);
-    } else break;
+    if (ch === '\t') {
+      const w = 4 - (col % 4);
+      if (col + w <= cols) { col += w; i++; }
+      else {
+        let out = ' '.repeat(col + w - cols);
+        col += w;
+        i++;
+        return out + expandWsRun(line, i, col);
+      }
+    } else {
+      col++;
+      i++;
+      if (col === cols && ch !== ' ' && ch !== '\t') return line.slice(i);
+    }
+  }
+  if (i >= line.length) return '';
+  if ((line[i] === ' ' || line[i] === '\t') && i > 0 &&
+      (line[i - 1] === ' ' || line[i - 1] === '\t')) {
+    return expandWsRun(line, i, col);
   }
   return line.slice(i);
 }
@@ -320,6 +351,7 @@ function tryParseDef(lines, i, end) {
   let s = '';
   const lineStart = [0];
   for (let k = i; k < maxLines; k++) {
+    if (k > i && isBlankLine(lines[k])) break; // a def never spans a blank line
     if (k > i) { s += '\n'; lineStart.push(s.length); }
     s += lines[k];
   }
@@ -401,14 +433,18 @@ function tryParseDef(lines, i, end) {
         if (ok) {
           title = t.title;
           usedEndPos = t.end;
-        } else {
-          return null; // junk after next-line title kills the def (cm-210)
         }
+        // junk after a next-line title: the def stands without the title
+        // and the title line stays unconsumed (cm-210)
       }
       // if no title parses, def ends at dest line (usedEndPos stays dd.end)
     }
   } else {
-    // same-line title: must parse and be followed by blank rest
+    // same-line title: must be separated from the destination by
+    // whitespace (cm-201), parse, and be followed by blank rest
+    let wsp = dd.end;
+    while (wsp < s.length && (s[wsp] === ' ' || s[wsp] === '\t')) wsp++;
+    if (wsp === dd.end) return null;
     const t = scanLinkTitle(s, dd.end, false);
     if (!t) return null;
     let r2 = t.end;
@@ -452,9 +488,15 @@ function htmlBlockStart(line, canInterrupt) {
   // type 1: script/pre/style/textarea open tag
   const m1 = /^<(script|pre|style|textarea)(?=[\s>]|$)/i.exec(s);
   if (m1) return { type: 1, close: '</' + m1[1].toLowerCase() };
-  // type 6: block tag open or close
+  // type 6: block tag open or close. A closing tag of a type-1 element
+  // (script/pre/style/textarea) does not interrupt a paragraph in marked;
+  // other block tags, open or closing, do.
   const m6 = /^<\/?([A-Za-z][A-Za-z0-9-]*)(?=[\s/>]|$)/.exec(s);
-  if (m6 && HTML_BLOCK_TAGS.has(m6[1].toLowerCase())) return { type: 6, close: null };
+  if (m6 && HTML_BLOCK_TAGS.has(m6[1].toLowerCase())) {
+    const type1Close = s[1] === '/' &&
+      (m6[1] === 'script' || m6[1] === 'pre' || m6[1] === 'style' || m6[1] === 'textarea');
+    if (canInterrupt || !type1Close) return { type: 6, close: null };
+  }
   // type 7: complete open or closing tag alone on the line (rest blank)
   if (canInterrupt === false) return null;
   const tag = scanHtmlTag(s, 0);
@@ -737,9 +779,15 @@ function lexBlocks(lines, start, end, ctx) {
         content.push(stripCols(lines[j], fs.indentCols));
         j++;
       }
+      // marked's fence capture is the raw text between the opening line
+      // and the newline preceding the closing fence; the rendered content
+      // then gains a trailing newline iff it is non-empty and lacks one.
+      const joined = content.join('\n');
+      let cap = joined;
+      if (!closed && content.length && hasNl(j - 1)) cap += '\n';
       blocks.push({
         t: 'code',
-        text: content.length ? content.join('\n') + '\n' : '',
+        text: cap === '' || cap.endsWith('\n') ? cap : cap + '\n',
         lang: fs.info ? unescapeString(fs.info.split(/\s+/)[0]) : '',
         span: [i, (closed ? j : j - 1)],
       });
@@ -775,7 +823,7 @@ function lexBlocks(lines, start, end, ctx) {
     const lm = listMarker(line);
     if (lm) {
       const r = lexList(lines, i, end, ctx, lm);
-      r.block.span = [i, r.next - 1];
+      r.block.span = [i, r.lastLine];
       blocks.push(r.block);
       i = r.next;
       continue;
@@ -798,9 +846,15 @@ function lexBlocks(lines, start, end, ctx) {
       let lastContent = -1;
       while (j < end) {
         const l = lines[j];
-        if (isBlankLine(l)) { content.push(''); j++; continue; }
+        if (isBlankLine(l)) {
+          // Blank lines are tentative (dropped if trailing), but an
+          // interior blank keeps its stripped remainder (a blank indented
+          // past 4 columns leaves spaces behind).
+          content.push(stripCols(l, 4));
+          j++; continue;
+        }
         if (leadingWs(l).cols >= 4) {
-          content.push(stripColsFlat(l, 4));
+          content.push(stripCols(l, 4));
           lastContent = content.length - 1;
           j++; continue;
         }
@@ -823,6 +877,7 @@ function lexBlocks(lines, start, end, ctx) {
       if (!ctx.defs.has(def.label)) {
         ctx.defs.set(def.label, { dest: def.dest, title: def.title });
       }
+      if (ctx.defSpans) ctx.defSpans.push([i, i + def.linesUsed - 1]);
       i += def.linesUsed;
       continue;
     }
@@ -877,6 +932,14 @@ function lexParagraph(lines, i, end, ctx, hasNl) {
     if (ctx.forceContinue && ctx.forceContinue.has(j)) {
       // a dedented lazy line from a blockquote: plain paragraph text,
       // never an interruption
+      textLines.push(l);
+      textIdx.push(j);
+      j++;
+      continue;
+    }
+    if (ctx.indentLazy && ctx.indentLazy.has(j)) {
+      // a lazy setext-underline line absorbed by a blockquote stays
+      // paragraph text; it never makes a heading
       textLines.push(l);
       textIdx.push(j);
       j++;
@@ -947,9 +1010,11 @@ function lexHtmlBlock(lines, i, end, ctx, hb) {
       j++;
     }
   }
-  const hasNl = (k) => k < end - 1 || ctx.eofNl;
+  // marked keeps a trailing newline after the block when another block
+  // follows immediately (no blank line between), or when the block reaches
+  // the end of the (sub)document and that source ends with a newline.
   let raw = rawLines.join('\n');
-  if (hasNl(i + rawLines.length - 1)) raw += '\n';
+  if ((j < end && !isBlankLine(lines[j])) || (j === end && ctx.eofNl)) raw += '\n';
   return { block: { t: 'html', raw }, next: j };
 }
 
@@ -997,13 +1062,18 @@ function isParaContinuation(line) {
 
 // Strip the blockquote marker from a line known to match /^ {0,3}>/.
 function stripQuoteMarker(line) {
+  // line matches /^ {0,3}>/ (leading chars are spaces). The inner line is
+  // what follows the '>' minus ONE column of whitespace (if any); the rest
+  // of the whitespace run is expanded to spaces at its original widths.
   const w = leadingWs(line);
-  let rest = line.slice(w.end + 1); // drop '>'
-  if (rest[0] === ' ') rest = rest.slice(1);
-  else if (rest[0] === '\t') {
-    const col = w.cols + 1;
-    const adv = 4 - (col % 4);
-    rest = ' '.repeat(Math.max(0, adv - 1)) + rest.slice(1);
+  const rest = line.slice(w.end + 1); // drop '>'
+  if (rest === '') return '';
+  const c0 = rest[0];
+  if (c0 === ' ') return expandWsRun(rest, 1, w.cols + 2);
+  if (c0 === '\t') {
+    const startCol = w.cols + 1;
+    const width = 4 - (startCol % 4);
+    return ' '.repeat(width - 1) + expandWsRun(rest, 1, startCol + width);
   }
   return rest;
 }
@@ -1022,8 +1092,10 @@ function lexBlockquote(lines, i, end, ctx) {
       continue;
     }
     if (isBlankLine(line)) break;
-    // possible lazy line
+    // possible lazy line (never across a blank inner line: the paragraph
+    // must still be open at the chunk's tail)
     if (inner.length === 0) break;
+    if (isBlankLine(inner[inner.length - 1])) break;
     if (!isParaContinuation(line)) break;
     if (!chunkEndsWithOpenParagraph(inner)) break;
     // accept the lazy line
@@ -1044,6 +1116,7 @@ function lexBlockquote(lines, i, end, ctx) {
   const childCtx = {
     defs: ctx.defs, eofNl: false,
     indentLazy, breakAfter, forceContinue,
+    defSpans: [],
   };
   const blocks = lexBlocks(inner, 0, inner.length, childCtx);
   return { block: { t: 'quote', blocks }, next: k };
@@ -1062,12 +1135,14 @@ function lexList(lines, i, end, ctx, firstMarker) {
   let loose = false;
   let k = i;
   let marker = firstMarker;
-  const baseCol = firstMarker.baseCol;
+  let lastLine = i; // last line actually consumed into an item chunk
   for (;;) {
     // collect one item starting at line k (marker line)
     const contentCol = marker.contentCol;
     const chunk = [];
-    chunk.push(sliceFromCol(lines[k], contentCol));
+    chunk.push(sliceExpanded(lines[k], contentCol));
+    const lazyMarks = new Set();
+    let hasContent = !isBlankLine(chunk[0]);
     let pendingBlanks = 0;
     let blankBetween = false;
     let j = k + 1;
@@ -1077,26 +1152,46 @@ function lexList(lines, i, end, ctx, firstMarker) {
       const l = lines[j];
       if (isBlankLine(l)) { pendingBlanks++; j++; continue; }
       const w = leadingWs(l);
+      // A thematic break ends the list outright (checked before the
+      // next-item test: `* * *` is a break, not an item).
+      if (w.cols < contentCol && isHrLine(l)) { listDone = true; break; }
       const lm = w.cols < contentCol ? listMarker(l) : null;
-      if (lm && lm.baseCol === baseCol && sameFamily(lm, marker)) {
+      // A sibling marker may sit at any base column below this item's
+      // content column (indented more deeply it would be item content).
+      const isSibling = lm !== null && sameFamily(lm, marker) && lm.baseCol < contentCol;
+      if (isSibling) {
         // next item begins
         if (pendingBlanks > 0) blankBetween = true;
         itemDone = true;
         break;
       }
-      if (w.cols < contentCol && isHrLine(l)) { listDone = true; break; }
+      if (lm) {
+        // a list marker of a different family/delimiter ends this list
+        listDone = true;
+        break;
+      }
+      if (pendingBlanks > 0 && !hasContent) {
+        // an item that is still empty after a blank line ends here;
+        // following lines belong outside the list
+        listDone = true;
+        break;
+      }
       if (w.cols >= contentCol) {
         for (let b = 0; b < pendingBlanks; b++) chunk.push('');
         pendingBlanks = 0;
-        chunk.push(stripCols(l, contentCol));
+        chunk.push(sliceExpanded(l, contentCol));
+        hasContent = true;
+        lastLine = j;
         j++;
         continue;
       }
-      // lazy continuation?
-      if (isParaContinuation(l) && chunkEndsWithOpenParagraph(chunk)) {
-        for (let b = 0; b < pendingBlanks; b++) chunk.push('');
-        pendingBlanks = 0;
-        chunk.push(l);
+      // lazy continuation (never across a blank line); the line's leading
+      // whitespace is stripped up to the content column, and the line is
+      // marked so the item's paragraph lexer treats it as plain text
+      if (pendingBlanks === 0 && isParaContinuation(l) && chunkEndsWithOpenParagraph(chunk)) {
+        lazyMarks.add(chunk.length);
+        chunk.push(stripCols(l, contentCol));
+        lastLine = j;
         j++;
         continue;
       }
@@ -1106,13 +1201,18 @@ function lexList(lines, i, end, ctx, firstMarker) {
     // lex the item chunk
     const childCtx = {
       defs: ctx.defs, eofNl: false,
-      indentLazy: null, breakAfter: null, forceContinue: null,
+      indentLazy: null, breakAfter: null,
+      forceContinue: lazyMarks.size ? lazyMarks : null,
+      defSpans: [],
     };
     const blocks = lexBlocks(chunk, 0, chunk.length, childCtx);
-    // blank line between two blocks inside the item => loose
-    for (let b = 0; b + 1 < blocks.length; b++) {
-      const gapFrom = blocks[b].span[1] + 1;
-      const gapTo = blocks[b + 1].span[0] - 1;
+    // blank line between two consumed segments (blocks or link reference
+    // definitions) inside the item => loose
+    const segs = blocks.map(b => b.span).concat(childCtx.defSpans);
+    segs.sort((a, b) => a[0] - b[0]);
+    for (let b = 0; b + 1 < segs.length; b++) {
+      const gapFrom = segs[b][1] + 1;
+      const gapTo = segs[b + 1][0] - 1;
       for (let g = gapFrom; g <= gapTo; g++) {
         if (isBlankLine(chunk[g])) { loose = true; break; }
       }
@@ -1132,6 +1232,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
       }
     }
     items.push({ blocks, task, checked });
+    if (k > lastLine) lastLine = k;
     if (listDone || !itemDone) {
       k = j;
       break;
@@ -1149,6 +1250,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
       items,
     },
     next: k,
+    lastLine,
   };
 }
 
@@ -1892,6 +1994,7 @@ export function parse(markdown) {
   const ctx = {
     defs: new Map(), eofNl,
     indentLazy: null, breakAfter: null, forceContinue: null,
+    defSpans: [],
   };
   const blocks = lexBlocks(lines, 0, lines.length, ctx);
   return renderBlocks(blocks, ctx.defs);
