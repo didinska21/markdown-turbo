@@ -1208,19 +1208,25 @@ function lexList(lines, i, end, ctx, firstMarker) {
     // only kept once an indented body line has started the body; if the
     // first body line is unindented the fence ends the item (empty)
     let fenceStarted = false;
+    // stripped indent of the previous non-blank fence body line; a
+    // body line at code depth (>= 4 after the frame strip) makes a
+    // following unindented line end the fence and the item
+    let fencePrevIndent = 0;
     const trackFence = (frameLine) => {
       if (openFence) {
         if (isFenceClose(frameLine, openFence.ch, openFence.len)) openFence = null;
       } else {
         openFence = fenceStart(frameLine);
         fenceStarted = false;
+        fencePrevIndent = 0;
       }
     };
     while (j < end && !itemDone && !listDone) {
       const l = lines[j];
       if (openFence) {
         const w0 = leadingWs(l);
-        if (!isBlankLine(l) && w0.cols < contentCol && !fenceStarted) {
+        if (!isBlankLine(l) && w0.cols < contentCol &&
+            (!fenceStarted || fencePrevIndent >= 4)) {
           listDone = true;
           break;
         }
@@ -1230,6 +1236,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
         chunk.push(isBlankLine(l) ? '' : frameLine);
         if (!isBlankLine(l)) {
           if (w0.cols >= contentCol) fenceStarted = true;
+          fencePrevIndent = leadingWs(frameLine).cols;
           trackFence(frameLine);
         }
         hasContent = true;
