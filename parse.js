@@ -814,7 +814,7 @@ function lexBlocks(lines, start, end, ctx) {
       // then gains a trailing newline iff it is non-empty and lacks one.
       const joined = content.join('\n');
       let cap = joined;
-      if (!closed && content.length && hasNl(j - 1)) cap += '\n';
+      if (!closed && content.length && content[content.length - 1] !== '' && hasNl(j - 1)) cap += '\n';
       blocks.push({
         t: 'code',
         text: cap === '' || cap.endsWith('\n') ? cap : cap + '\n',
@@ -1238,6 +1238,9 @@ function lexList(lines, i, end, ctx, firstMarker) {
     // whether the previous non-blank body line starts with a fence
     // run: a following unindented line also ends the fence and item
     let fencePrevRun = false;
+    // whether the previous non-blank body line is an ATX heading or a
+    // thematic break: a following unindented line also ends them
+    let fencePrevBlock = false;
     const trackFence = (frameLine) => {
       if (openFence) {
         if (isFenceClose(frameLine, openFence.ch, openFence.len)) openFence = null;
@@ -1247,6 +1250,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
         fencePrevIndent = 0;
         fencePrevHtml = false;
         fencePrevRun = false;
+        fencePrevBlock = false;
       }
     };
     while (j < end && !itemDone && !listDone) {
@@ -1254,7 +1258,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
       if (openFence) {
         const w0 = leadingWs(l);
         if (!isBlankLine(l) && w0.cols < contentCol &&
-            (!fenceStarted || fencePrevIndent >= 4 || fencePrevHtml || fencePrevRun)) {
+            (!fenceStarted || fencePrevIndent >= 4 || fencePrevHtml || fencePrevRun || fencePrevBlock)) {
           listDone = true;
           break;
         }
@@ -1270,6 +1274,7 @@ function lexList(lines, i, end, ctx, firstMarker) {
           const fw = leadingWs(frameLine);
           fencePrevRun = fw.cols <= 3 &&
             (frameLine.startsWith('```', fw.end) || frameLine.startsWith('~~~', fw.end));
+          fencePrevBlock = atxHeading(frameLine) !== null || isHrLine(frameLine);
           trackFence(frameLine);
         }
         hasContent = true;
@@ -1329,8 +1334,11 @@ function lexList(lines, i, end, ctx, firstMarker) {
       }
       // lazy continuation (never across a blank line); marked strips
       // only whole tab stops (4-column units) from such a line, and the
-      // line is marked so the item's paragraph lexer treats it as text
-      if (pendingBlanks === 0 && isParaContinuation(l) && chunkEndsWithOpenParagraph(chunk, true)) {
+      // line is marked so the item's paragraph lexer treats it as text.
+      // A line starting with a backtick run is never lazy, even when
+      // the run is not a valid fence (backticks in the info string).
+      if (pendingBlanks === 0 && isParaContinuation(l) && chunkEndsWithOpenParagraph(chunk, true) &&
+          !(w.cols <= 3 && l.startsWith('```', w.end))) {
         lazyMarks.add(chunk.length);
         if (setextLevel(l) > 0) setextLazy.add(chunk.length);
         chunk.push(sliceExpanded(l, Math.floor(w.cols / 4) * 4));
