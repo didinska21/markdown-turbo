@@ -1502,13 +1502,19 @@ function parseInline(text, defs) {
       while (oi >= 0 && delimStack[oi].node.seq > floorSeq) {
         const opener = delimStack[oi];
         if (opener.ch === closer.ch && opener.canOpen && opener.node.len > 0) {
-          if (poison && closer.ch === poison.ch && poison.guarded.has(opener) &&
-              closer.node.len <= poison.budget &&
-              (poison.caseB
-                ? closer.node.len + opener.node.len <= 3
-                : opener.node.len === 2)) {
-            poisonBlocked = true;
-            break;
+          if (poison && closer.ch === poison.ch && poison.guarded.has(opener)) {
+            if (poison.caseB) {
+              // case B: the guarded opener is skipped for this closer
+              // while budget lasts and the lengths sum to at most 3
+              if (poison.budget > 0 && closer.node.len + opener.node.len <= 3) {
+                poisonBlocked = true;
+                oi--;
+                continue;
+              }
+            } else if (opener.node.len === 2 && closer.node.len <= poison.budget) {
+              poisonBlocked = true;
+              break;
+            }
           }
           // rule of 3: only when one of the runs can both open and close
           if ((closer.canOpen || opener.canClose) &&
@@ -1536,6 +1542,11 @@ function parseInline(text, defs) {
               caseB: use === 2,
             };
           }
+          if (use === 2 && poison && poison.ch === closer.ch && poison.guarded.has(opener)) {
+            // a strong pairing that escapes the poison block consumes
+            // the closer run from its right: leftover stars render inside
+            closer.node.flip = true;
+          }
           opener.node.open = '<' + tag + '>' + (opener.node.open || '');
           closer.node.close = (closer.node.close || '') + '</' + tag + '>';
           // delimiters between opener and closer are deactivated
@@ -1549,7 +1560,7 @@ function parseInline(text, defs) {
           oi--;
         }
       }
-      if (poisonBlocked && poison) {
+      if (poisonBlocked && poison && !matched) {
         if (!closer.canOpen) {
           poison.budget -= closer.node.len;
           if (poison.budget <= 0) poison = null;
@@ -2188,7 +2199,9 @@ function parseInline(text, defs) {
   let out = '';
   for (const nd of nodes) {
     if (nd.k === 'delim') {
-      out += nd.close + nd.ch.repeat(nd.len) + nd.open;
+      out += nd.flip
+        ? nd.ch.repeat(nd.len) + nd.close + nd.open
+        : nd.close + nd.ch.repeat(nd.len) + nd.open;
     } else {
       out += nd.html;
     }
