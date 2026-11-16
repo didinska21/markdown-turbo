@@ -1457,6 +1457,10 @@ function parseInline(text, defs) {
   const s = text;
   const nodes = [];
   const delimStack = []; // {node, ch, canOpen, canClose}
+  // when a link's text ends inside an unterminated backtick span of
+  // length L, marked leaves every delimiter run inert until the next
+  // run of L backticks (which is itself literal): deadDelim tracks L
+  let deadDelim = 0;
   // marked quirk: when a delimiter run that can both open and close forms
   // an em (use 1) pair that fully consumes a length-1 opener, the openers
   // below it become "guarded": a later closer of the same char cannot pair
@@ -1621,6 +1625,71 @@ function parseInline(text, defs) {
     return trimAutolinkUrl(run);
   }
 
+  // Simulate marked's bracket search over the backtick runs in
+  // s[from..to): a span opens at a run; a run of the same length closes
+  // it; a shorter run is span content; a longer run closes it (excess
+  // discarded). Returns -1 when the bracket search fails (the ']' is
+  // swallowed: a length-1 span, a span containing a complete inner
+  // pair, or a span with no completed sibling and no backtick content
+  // at all); otherwise returns the length of the span still open at
+  // the end of the text (0 when every span closed).
+  function linkTextBackticks(from, to) {
+    let pending = 0;
+    let completed = 0;
+    let innerAny = false;
+    let innerPair = false;
+    const counts = new Map();
+    let p = from;
+    while (p < to) {
+      const c = s[p];
+      if (c === '\\') { p += 2; continue; }
+      if (c !== '`') { p++; continue; }
+      let m = 0;
+      while (p + m < to && s[p + m] === '`') m++;
+      if (pending === 0) {
+        pending = m;
+        innerAny = false;
+        innerPair = false;
+        counts.clear();
+      } else if (m === pending) {
+        pending = 0;
+        completed++;
+      } else if (m < pending) {
+        innerAny = true;
+        const c2 = (counts.get(m) || 0) + 1;
+        counts.set(m, c2);
+        if (c2 >= 2) innerPair = true;
+      } else {
+        pending = 0;
+        completed++;
+      }
+      p += m;
+    }
+    if (pending === 0) return 0;
+    if (pending === 1) return -1;
+    if (innerPair) return -1;
+    if (completed === 0 && !innerAny) return -1;
+    return pending;
+  }
+
+  // Find the ']' that closes the bracket whose text starts at `from`,
+  // counting nested brackets (backticks are handled by the simulation).
+  function bracketCloseCandidate(from) {
+    let depth = 1;
+    let p = from;
+    while (p < n) {
+      const c = s[p];
+      if (c === '\\') { p += 2; continue; }
+      if (c === '[') depth++;
+      else if (c === ']') {
+        depth--;
+        if (depth === 0) return p;
+      }
+      p++;
+    }
+    return -1;
+  }
+
   // Try to form a link/image at a ']' (index i in s). Returns the new index
   // after the consumed construct, or -1 if not a link.
   // When a bracket fails to form a link, an autolink node that was
@@ -1660,6 +1729,14 @@ function parseInline(text, defs) {
       bracketStack.pop();
       return extendCappedAutolink(closeIdx);
     }
+    // marked's bracket search can fail on backtick runs in the text:
+    // the ']' is then literal text, not a link close
+    const btPending = linkTextBackticks(br.srcIdx + (br.isImage ? 2 : 1), closeIdx);
+    if (btPending < 0) {
+      bracketStack.pop();
+      return extendCappedAutolink(closeIdx);
+    }
+    br.btPending = btPending;
     let dest = null;
     let title = null;
     let endPos = -1;
@@ -1793,6 +1870,20 @@ function parseInline(text, defs) {
         // after the opener) — correct because ']' is the current position.
       }
     }
+    if (br.btPending > 0) {
+      // the dead region exists only when a run of the pending length
+      // actually follows in this paragraph (it bounds the region)
+      let p = endPos;
+      while (p < n) {
+        if (s[p] === '\\') { p += 2; continue; }
+        if (s[p] === '`') {
+          let m = 0;
+          while (s[p + m] === '`') m++;
+          if (m === br.btPending) { deadDelim = br.btPending; break; }
+          p += m;
+        } else p++;
+      }
+    }
     return endPos;
   }
 
@@ -1848,6 +1939,10 @@ function parseInline(text, defs) {
       case '`': {
         let run = 0;
         while (s[i + run] === '`') run++;
+        if (deadDelim > 0 && run === deadDelim) {
+          // this run ends the dead region and is lexed normally
+          deadDelim = 0;
+        }
         // find closing run of exactly this length
         let j = i + run;
         let found = -1;
@@ -1858,6 +1953,17 @@ function parseInline(text, defs) {
             if (m === run) { found = j; break; }
             j += m;
           } else j++;
+        }
+        // inside a bracket, a code span may not cross the bracket's
+        // closing ']' when the bracket's text passes the backtick
+        // simulation (marked finds the ']' first in that case)
+        if (found >= 0 && bracketStack.length > 0) {
+          const top = bracketStack[bracketStack.length - 1];
+          const textStart = top.srcIdx + (top.isImage ? 2 : 1);
+          const cand = bracketCloseCandidate(textStart);
+          if (cand >= 0 && found >= cand && linkTextBackticks(textStart, cand) >= 0) {
+            found = -1;
+          }
         }
         if (found < 0) {
           buf += '`'.repeat(run);
@@ -1993,6 +2099,12 @@ function parseInline(text, defs) {
       case '~': {
         let run = 0;
         while (s[i + run] === c) run++;
+        if (deadDelim > 0) {
+          // inert inside a dead region (see deadDelim above)
+          buf += c.repeat(run);
+          i += run;
+          break;
+        }
         if (c === '~' && run > 2) {
           buf += '~'.repeat(run);
           i += run;
